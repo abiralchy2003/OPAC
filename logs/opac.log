@@ -535,3 +535,12 @@
 2026-04-05 18:29:40,832 [INFO] opac.npu_engine: Generated ~59 tokens in 8.5s (~6.9 tok/s) on NPU
 2026-04-05 18:30:00,212 [INFO] opac.npu_engine: Generated ~153 tokens in 19.4s (~7.9 tok/s) on NPU
 2026-04-05 18:35:25,012 [INFO] opac.npu_engine: Model unloaded.
+2026-04-05 20:56:58,642 [INFO] opac.npu_engine: Loading model from D:\opac\models\qwen3-8b-int4-cw-npu onto NPU ...
+2026-04-05 20:56:58,644 [INFO] opac.npu_engine: First compile ~30-60 s — cached after first run.
+2026-04-05 20:58:09,751 [INFO] opac.npu_engine: Model loaded on NPU in 71.1s
+2026-04-05 20:58:16,342 [INFO] opac.documents: Reading PDF: Prashna_CV_KTM.pdf
+2026-04-05 20:58:18,073 [INFO] opac.documents: PDF read via PyMuPDF: 2 pages, 1350 chars
+2026-04-05 20:58:18,075 [INFO] opac.summarizer: [PDF] Prashna_CV_KTM — 174 words, 2 page(s)
+2026-04-05 20:58:18,076 [INFO] opac.summarizer: Summarising 1350 chars in 1 chunk(s)
+2026-04-05 20:59:00,036 [INFO] opac.npu_engine: Generated ~169 tokens in 42.0s (~4.0 tok/s) on NPU
+2026-04-05 20:59:37,613 [INFO] opac.npu_engine: Model unloaded.
