@@ -2,6 +2,8 @@
 
 > Fully local AI agent running on the Intel NPU.  
 > No cloud. No API keys. No data leaves your device.
+> I made this AI agent for my personal Work and it is customized for my Laptop
+> My Laptop: Acer Swift 14 AI 2024 model, 16 GB RAM, 512 SSD, Intel Core 7 CPU with NPU and Integrated Intel Arc Graphics
 
 ---
 
