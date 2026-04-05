@@ -1,0 +1,38 @@
+# OPAC — Python Dependencies
+# ============================
+# Install with:  pip install -r requirements.txt
+#
+# After installing, install OpenVINO separately:
+#   pip install openvino openvino-genai
+#   pip install huggingface_hub    (for model download)
+#
+# NPU driver (must be installed at OS level — not via pip):
+#   Windows: https://www.intel.com/content/www/us/en/download/794734/
+#   Linux:   https://github.com/intel/linux-npu-driver/releases
+
+# ── Document reading ──────────────────────────────────────────────────────────
+PyMuPDF>=1.23.0          # PDF reading (preferred)
+pypdf>=4.0.0             # PDF reading (fallback if PyMuPDF unavailable)
+python-docx>=1.1.0       # Word .docx
+python-pptx>=1.0.0       # PowerPoint .pptx
+openpyxl>=3.1.0          # Excel .xlsx
+beautifulsoup4>=4.12.0   # HTML parsing
+requests>=2.31.0         # Web page fetching
+lxml>=5.0.0              # Faster HTML parser for BeautifulSoup
+
+# ── Voice (Phase 3) ───────────────────────────────────────────────────────────
+# faster-whisper>=1.0.0  # Speech-to-text (install when doing Phase 3)
+# sounddevice>=0.4.6     # Microphone input
+# openWakeWord>=0.6.0    # Wake word detection
+
+# ── TTS (Phase 3) ─────────────────────────────────────────────────────────────
+# piper-tts>=1.2.0       # Text-to-speech Linux (install when doing Phase 3)
+
+# ── Utilities ─────────────────────────────────────────────────────────────────
+psutil>=5.9.0            # RAM / CPU monitoring
+pyyaml>=6.0.0            # Config file support
+
+# ── AI / NPU (install separately — large downloads) ──────────────────────────
+# openvino>=2024.2.0
+# openvino-genai>=2024.2.0
+# huggingface_hub>=0.23.0
