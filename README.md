@@ -2,6 +2,8 @@
 
 > Fully local AI agent running on the Intel NPU.  
 > No cloud. No API keys. No data leaves your device.
+> I made this AI agent for my personal Work and it is customized for my Laptop
+> My Laptop: Acer Swift 14 AI 2024 model, 16 GB RAM, 512 SSD, Intel Core 7 CPU with NPU and Integrated Intel Arc Graphics
 
 ---
 
@@ -9,20 +11,17 @@
 
 | Feature | Status |
 |---|---|
-| LLM inference on Intel NPU via OpenVINO GenAI | ✅ Phase 1 |
-| INT4 quantised model (Phi-3 Mini / Qwen3-4B) | ✅ Phase 1 |
-| Auto chunking for long documents | ✅ Phase 1 |
-| PDF summarisation (PyMuPDF + pypdf fallback) | ✅ Phase 2 |
-| Word .docx summarisation | ✅ Phase 2 |
-| PowerPoint .pptx summarisation | ✅ Phase 2 |
-| Excel .xlsx summarisation | ✅ Phase 2 |
-| Web page / URL summarisation | ✅ Phase 2 |
-| HTML file reading | ✅ Phase 2 |
-| Plain text / Markdown reading | ✅ Phase 2 |
-| Interactive text REPL | ✅ Phase 1 |
-| Cross-platform: Windows + Linux | ✅ Both phases |
-| Voice input / output | 🔜 Phase 3 |
-| App launcher | 🔜 Phase 5 |
+| LLM inference on Intel NPU via OpenVINO GenAI 
+| INT4 quantised model (Phi-3 Mini / Qwen3-4B) | 
+| Auto chunking for long documents
+| PDF summarisation (PyMuPDF + pypdf fallback) 
+| Word .docx summarisation 
+| PowerPoint .pptx summarisation 
+| Excel .xlsx summarisation 
+| Web page / URL summarisation | 
+| HTML file reading | 
+| Plain text / Markdown reading 
+| Interactive text REPL 
 
 ---
 
