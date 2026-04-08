@@ -34,7 +34,7 @@ DEFAULT_MODEL_DIR  = MODELS_DIR / "qwen3-8b-int4-cw-npu"
 
 # ── NPU generation config ────────────────────────────────────────────────────
 NPU_CONFIG = {
-    "MAX_PROMPT_LEN":   2048,
+    "MAX_PROMPT_LEN":   4096,
     "MIN_RESPONSE_LEN": 32,
 }
 MAX_NEW_TOKENS   = 512          # max tokens the model generates per response
