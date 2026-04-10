@@ -1,13 +1,14 @@
 """
 OPAC Summarizer  (Phase 2)
 ===========================
-Reads documents, chunks long content, and calls the NPU engine.
-Each chunk is sent as a fresh independent call — no shared session state.
+Smart combine strategy:
+  - If all section summaries fit within the NPU context window → combine in one
+    call (faster, single NPU pass).
+  - If they overflow → hierarchical batching (groups of COMBINE_BATCH_SIZE).
 
-Hierarchical combine: if there are many sections, summaries are first
-grouped into batches, then each batch is combined, then the batch
-results are combined into a final summary. This prevents the combine
-prompt from exceeding the NPU context window (MAX_PROMPT_LEN).
+The threshold is estimated from the actual text length of the summaries,
+using a conservative 1.5 chars-per-token ratio so we never get close
+to the hard MAX_PROMPT_LEN limit.
 """
 
 from __future__ import annotations
@@ -18,14 +19,38 @@ from typing import List
 from documents.loader import DocumentLoader
 from utils.chunker import chunk_text
 from utils.logger import get_logger
-from config.settings import CHUNK_MAX_CHARS
+from config.settings import CHUNK_MAX_CHARS, NPU_CONFIG
 
 logger = get_logger("opac.summarizer")
 
-# How many section summaries to combine in one NPU call.
-# 18 summaries of ~80 words each = ~1440 words ≈ 1800 tokens → overflows 2048.
-# Batch of 5 summaries × ~80 words = ~400 words ≈ 500 tokens → safe for any MAX_PROMPT_LEN.
+# How many section summaries per batch when hierarchical mode is needed
 COMBINE_BATCH_SIZE = 5
+
+# Conservative estimate: chars per token (Qwen3 averages ~4, we use 3 to be safe)
+CHARS_PER_TOKEN = 3
+
+# Reserve this many tokens for the combine prompt template overhead + response
+PROMPT_OVERHEAD_TOKENS = 300
+
+def _max_prompt_len() -> int:
+    """Read MAX_PROMPT_LEN from NPU config at runtime."""
+    return int(NPU_CONFIG.get("MAX_PROMPT_LEN", 2048))
+
+def _fits_in_one_call(summaries: List[str]) -> bool:
+    """
+    Return True if all summaries can be combined in a single NPU call
+    without overflowing MAX_PROMPT_LEN.
+    """
+    total_chars  = sum(len(s) for s in summaries)
+    est_tokens   = total_chars // CHARS_PER_TOKEN
+    available    = _max_prompt_len() - PROMPT_OVERHEAD_TOKENS
+    fits         = est_tokens <= available
+    logger.info(
+        f"Combine check: ~{est_tokens} tokens needed, "
+        f"{available} available (MAX_PROMPT_LEN={_max_prompt_len()}) "
+        f"→ {'single call' if fits else 'hierarchical batching'}"
+    )
+    return fits
 
 
 class Summarizer:
@@ -56,8 +81,8 @@ class Summarizer:
             section_summaries.append(summary)
             print(f" done ({len(summary.split())} words)")
 
-        # ── Reduce: hierarchical combine ─────────────────────────────────────
-        return self._hierarchical_combine(section_summaries, stream=stream)
+        # ── Reduce: smart combine ─────────────────────────────────────────────
+        return self._smart_combine(section_summaries, stream=stream)
 
     def summarize_file(self, path: str, stream: bool = True) -> str:
         t0 = time.time()
@@ -79,32 +104,47 @@ class Summarizer:
         print(f"\n  [OPAC] Fetched: {doc}  ({time.time()-t0:.1f}s)")
         return self.summarize_text(doc.text, stream=stream)
 
-    # ── hierarchical combine ─────────────────────────────────────────────────
+    # ── smart combine ─────────────────────────────────────────────────────────
+
+    def _smart_combine(self, summaries: List[str], stream: bool) -> str:
+        """
+        Choose combine strategy based on estimated token count vs MAX_PROMPT_LEN.
+
+        MAX_PROMPT_LEN = 2048  and summaries overflow  → hierarchical batching
+        MAX_PROMPT_LEN = 4096  and summaries fit        → single call (old method)
+        MAX_PROMPT_LEN = 4096  and summaries overflow   → hierarchical batching
+        """
+        if _fits_in_one_call(summaries):
+            # ── Single call (old method) ──────────────────────────────────────
+            print(f"  [OPAC] Combining {len(summaries)} summaries in one call ...")
+            prompt = self.engine.build_combine_prompt(summaries)
+            return self._call(prompt, stream=stream)
+        else:
+            # ── Hierarchical batching ─────────────────────────────────────────
+            print(f"  [OPAC] {len(summaries)} summaries too large for one call "
+                  f"(MAX_PROMPT_LEN={_max_prompt_len()}) — using batch combine ...")
+            return self._hierarchical_combine(summaries, stream=stream)
 
     def _hierarchical_combine(self, summaries: List[str], stream: bool) -> str:
         """
-        Combine summaries in batches to stay within the NPU context window.
+        Repeatedly combine in batches until only one summary remains.
 
-        Example with 18 summaries and COMBINE_BATCH_SIZE=5:
-          Round 1: [s1-s5] → b1, [s6-s10] → b2, [s11-s15] → b3, [s16-s18] → b4
-          Round 2: [b1-b4] → final  (4 items, fits easily)
-
-        If there is only one batch, it is combined directly (no extra round).
+        Example with 18 summaries, batch size 5:
+          Round 1: [1-5]→b1  [6-10]→b2  [11-15]→b3  [16-18]→b4
+          Round 2: [b1-b4] fits in one call → final summary
         """
-        current = summaries
+        current   = summaries
         round_num = 1
 
         while len(current) > 1:
-            if len(current) <= COMBINE_BATCH_SIZE:
-                # Final combine — show streaming output
+            if _fits_in_one_call(current):
                 print(f"  [OPAC] Final combine ({len(current)} summaries) ...")
                 prompt = self.engine.build_combine_prompt(current)
                 return self._call(prompt, stream=stream)
 
-            # Batch combine — silent (no streaming for intermediate steps)
             batches = _split_into_batches(current, COMBINE_BATCH_SIZE)
             print(f"  [OPAC] Combine round {round_num}: "
-                  f"{len(current)} summaries → {len(batches)} batches ...")
+                  f"{len(current)} summaries → {len(batches)} batches of {COMBINE_BATCH_SIZE} ...")
 
             combined = []
             for j, batch in enumerate(batches, 1):
@@ -119,13 +159,11 @@ class Summarizer:
             current   = combined
             round_num += 1
 
-        # Only one summary left (edge case: started with 1)
         return current[0] if current else "No content to summarise."
 
     # ── internal ─────────────────────────────────────────────────────────────
 
     def _call(self, user_message: str, stream: bool) -> str:
-        """Send one user message to the engine as a fresh, stateless call."""
         if stream:
             print("\n  OPAC: ", end="", flush=True)
             result = self.engine._generate_chat(
@@ -138,8 +176,7 @@ class Summarizer:
             return self.engine._generate_chat(user_message=user_message)
 
 
-# ── utility ──────────────────────────────────────────────────────────────────
+# ── utility ───────────────────────────────────────────────────────────────────
 
 def _split_into_batches(items: List[str], batch_size: int) -> List[List[str]]:
-    """Split a list into sub-lists of at most batch_size items."""
     return [items[i:i + batch_size] for i in range(0, len(items), batch_size)]
