@@ -1,14 +1,5 @@
 """
 OPAC Agent  (Phase 1 + 2 + 3 + 3.5)
-======================================
-Central orchestrator. Owns:
-  - NPU engine       (LLM inference)
-  - Summarizer       (document + web summarisation)
-  - Voice STT        (Phase 3 -- speech to text)
-  - Voice TTS        (Phase 3 -- text to speech)
-  - Wake word        (Phase 3 -- "Hey OPAC" trigger)
-  - Wikipedia engine (Phase 3.5 -- factual knowledge lookup)
-  - Conversation memory with tone awareness
 """
 
 from __future__ import annotations
@@ -41,13 +32,25 @@ _INTENT_VOICE  = re.compile(r"^voice\s*(on|off)$", re.I)
 _INTENT_CLEAR  = re.compile(r"^(clear|reset|forget|new chat)$", re.I)
 _INTENT_TONE   = re.compile(r"^(be|talk|speak)\s+(casual|formal|friendly|professional).*$", re.I)
 
+# Greetings and casual messages that go straight to chat
 _CASUAL = re.compile(
     r"^(hi|hello|hey|how are you|what.?s up|good\s+(morning|afternoon|evening|night)|"
-    r"howdy|sup|greetings|yo\b|morning|evening|afternoon|night|"
+    r"howdy|sup|greetings|yo\b|morning|evening|afternoon|"
     r"how.?s (it going|everything)|what can you do|who are you|"
     r"tell me about yourself|introduce yourself|"
     r"thanks?|thank you|cheers|cool|nice|great|awesome|ok|okay|alright|"
     r"are you there|you there|can you hear me).*$",
+    re.I
+)
+
+# Patterns used to extract the real topic from a question
+# e.g. "can you tell me about chess" -> "chess"
+_TOPIC_STRIP = re.compile(
+    r"^(?:can you |could you |please |do you know |tell me |"
+    r"what is |what are |who is |who was |explain |describe |"
+    r"give me info(rmation)? (on|about) |"
+    r"tell me about |i want to know about |"
+    r"i want to learn about |what do you know about )",
     re.I
 )
 
@@ -162,33 +165,33 @@ class OPACAgent:
         self.start()
         return self.summarizer.summarize_url(url)
 
-    def chat(self, query: str, stream: bool = True) -> str:
+    def chat(self, query: str) -> str:
+        """
+        Core chat method. Streams response to terminal.
+        Returns the full response string.
+        """
         self.start()
 
         tone_system    = self._build_tone_system(query)
         enriched_query = self._enrich_with_wiki(query)
         recent         = self._history[-6:] if self._history else None
 
-        if stream:
-            collected = []
-            def _cb(tok):
-                collected.append(tok)
-                print(tok, end="", flush=True)
-                return False
-            self.engine._generate_chat(
-                user_message=enriched_query,
-                system=tone_system,
-                history=recent,
-                streamer_callback=_cb,
-            )
-            print()
-            response = "".join(collected).strip()
-        else:
-            response = self.engine._generate_chat(
-                user_message=enriched_query,
-                system=tone_system,
-                history=recent,
-            )
+        # Stream tokens directly to terminal
+        collected = []
+        def _cb(tok):
+            collected.append(tok)
+            print(tok, end="", flush=True)
+            return False
+
+        self.engine._generate_chat(
+            user_message=enriched_query,
+            system=tone_system,
+            history=recent,
+            streamer_callback=_cb,
+        )
+        print()  # newline after streamed response
+
+        response = "".join(collected).strip()
 
         if response:
             self._history.append({"role": "user",      "content": query})
@@ -200,15 +203,18 @@ class OPACAgent:
         return response
 
     def _enrich_with_wiki(self, query: str) -> str:
+        """Inject Wikipedia context into the query if relevant."""
         if not self._wiki or not self._wiki.available:
             return query
         if not self._wiki.is_factual_query(query):
             return query
-        results = self._wiki.search(query)
+        # Extract clean topic for Wikipedia search
+        topic   = _extract_topic(query)
+        results = self._wiki.search(topic)
         if not results:
             return query
         ctx = self._wiki.format_context(results)
-        logger.info(f"Wikipedia context injected ({len(results)} results)")
+        logger.info(f"Wikipedia context injected: topic='{topic}' ({len(results)} results)")
         return WIKI_CONTEXT_PROMPT.format(wiki_context=ctx, question=query)
 
     # ── interactive REPL ───────────────────────────────────────────────────────
@@ -222,9 +228,8 @@ class OPACAgent:
 
         if voice or VOICE_ENABLED:
             if self.enable_voice():
-                print(f"  [OPAC] Voice enabled  checkmark  (TTS: {self._tts.backend})")
+                print(f"  [OPAC] Voice enabled  (TTS: {self._tts.backend})")
                 self.enable_wake_word()
-        print()
 
         while True:
             try:
@@ -237,9 +242,8 @@ class OPACAgent:
                 continue
 
             if _INTENT_QUIT.match(raw):
-                resp = "Goodbye! Take care."
-                print(f"\n  OPAC: {resp}\n")
-                self._tts_speak(resp)
+                print("\n  OPAC: Goodbye! Take care.\n")
+                self._tts_speak("Goodbye! Take care.")
                 break
 
             if _INTENT_HELP.match(raw):
@@ -296,14 +300,16 @@ class OPACAgent:
     # ── router ─────────────────────────────────────────────────────────────────
 
     def _handle_input(self, user_input: str):
-        # 1. Casual -- always goes to chat immediately
+        """Route input to the correct handler."""
+
+        # 1. Greetings and casual -- straight to chat, no routing
         if _CASUAL.match(user_input.strip()):
             print("\n  OPAC: ", end="", flush=True)
             self.chat(user_input)
             print()
             return
 
-        # 2. Explicit Wikipedia search
+        # 2. Explicit Wikipedia search command
         m = _INTENT_WIKI.match(user_input)
         if m:
             self._do_wiki_search(m.group(1).strip())
@@ -348,45 +354,75 @@ class OPACAgent:
         # 6. Open app -- Phase 5
         m = _INTENT_OPEN.match(user_input)
         if m:
-            print(f"\n  OPAC: App launcher coming in Phase 5. (open: '{m.group(1)}')\n")
+            print(f"\n  OPAC: App launcher coming in Phase 5. (you asked to open: '{m.group(1)}')\n")
             return
 
-        # 7. Everything else -- general chat with Wikipedia enrichment
+        # 7. Everything else -- general chat with optional Wikipedia enrichment
         print("\n  OPAC: ", end="", flush=True)
         self.chat(user_input)
         print()
 
-    # ── Wikipedia search ───────────────────────────────────────────────────────
+    # ── Wikipedia explicit search ───────────────────────────────────────────────
 
     def _do_wiki_search(self, query: str):
+        """Search Wikipedia and answer based on results."""
         if not self._wiki or not self._wiki.available:
-            print("\n  [OPAC] Wikipedia not available. Run: pip install wikipedia-api\n")
+            print("\n  [OPAC] Wikipedia not available.")
+            print("  Install: pip install wikipedia-api\n")
+            # Fall through to plain chat as fallback
+            print("\n  OPAC: ", end="", flush=True)
+            self.chat(f"Tell me about {query}")
+            print()
             return
-        print(f"\n  [OPAC] Searching Wikipedia: '{query}' ...")
-        results = self._wiki.search(query)
+
+        topic   = _extract_topic(query)
+        print(f"\n  [OPAC] Searching Wikipedia: '{topic}' ...")
+        results = self._wiki.search(topic)
+
         if not results:
-            print(f"\n  OPAC: No Wikipedia results found for '{query}'.\n")
+            # No Wikipedia results -- answer from LLM knowledge
+            print(f"  [OPAC] No Wikipedia results for '{topic}' -- answering from knowledge ...\n")
+            print("  OPAC: ", end="", flush=True)
+            self.chat(f"Tell me about {topic}")
+            print()
             return
+
         ctx    = self._wiki.format_context(results)
-        prompt = WIKI_CONTEXT_PROMPT.format(wiki_context=ctx, question=query)
-        print(f"  [OPAC] Found {len(results)} article(s). Generating answer ...\n  OPAC: ", end="", flush=True)
-        response = self.engine._generate_chat(
+        prompt = WIKI_CONTEXT_PROMPT.format(wiki_context=ctx, question=f"Tell me about {topic}")
+        print(f"  [OPAC] Found {len(results)} article(s). Generating answer ...\n")
+        print("  OPAC: ", end="", flush=True)
+
+        collected = []
+        def _cb(tok):
+            collected.append(tok)
+            print(tok, end="", flush=True)
+            return False
+
+        self.engine._generate_chat(
             user_message=prompt,
-            streamer_callback=lambda tok: print(tok, end="", flush=True),
+            streamer_callback=_cb,
         )
         print("\n")
+        response = "".join(collected).strip()
         self._tts_speak(response)
+
         if response:
             self._history.append({"role": "user",      "content": query})
             self._history.append({"role": "assistant",  "content": response})
 
-    # ── tone detection ─────────────────────────────────────────────────────────
+    # ── tone ───────────────────────────────────────────────────────────────────
 
     def _build_tone_system(self, user_message: str) -> str:
         if self._tone == "casual":
-            hint = "\n\nTone: Be casual, warm, and friendly. Use everyday language. Light humour is welcome."
+            hint = (
+                "\n\nTone instruction: Be casual, warm, and friendly. "
+                "Use everyday language. You can be playful and light-hearted."
+            )
         elif self._tone in ("formal", "professional"):
-            hint = "\n\nTone: Be precise, professional, and well-structured. Use clear formal language."
+            hint = (
+                "\n\nTone instruction: Be precise, professional, and well-structured. "
+                "Use clear formal language."
+            )
         else:
             hint = self._auto_detect_tone(user_message)
         return SYSTEM_PROMPT + hint
@@ -404,16 +440,24 @@ class OPACAgent:
         casual = len(casual_re.findall(text))
         formal = len(formal_re.findall(text))
         if casual > formal:
-            return "\n\nTone: The user is casual -- respond warmly and conversationally."
+            return (
+                "\n\nTone instruction: The user is being casual and friendly -- "
+                "respond warmly and naturally, like a helpful friend."
+            )
         elif formal > casual:
-            return "\n\nTone: The user is formal -- respond with precision and professionalism."
+            return (
+                "\n\nTone instruction: The user is being formal -- "
+                "respond with precision and professionalism."
+            )
         return ""
 
-    # ── helpers ────────────────────────────────────────────────────────────────
+    # ── TTS helper ─────────────────────────────────────────────────────────────
 
     def _tts_speak(self, text: str) -> None:
         if self._voice_active and self._tts and self._tts.loaded:
             self._tts.speak(text)
+
+    # ── UI ─────────────────────────────────────────────────────────────────────
 
     def _print_help(self):
         print("""
@@ -451,6 +495,25 @@ class OPACAgent:
 """)
 
 
+# ── Wikipedia topic extractor ──────────────────────────────────────────────────
+
+def _extract_topic(query: str) -> str:
+    """
+    Strip question preambles to get a clean search term.
+    'can you tell me about chess' -> 'chess'
+    'what is machine learning'    -> 'machine learning'
+    'Nepal'                       -> 'Nepal'
+    """
+    clean = query.strip().rstrip("?").strip()
+    # Remove leading question words / polite phrases
+    clean = _TOPIC_STRIP.sub("", clean).strip()
+    # If still has words like "about X", extract X
+    m = re.match(r"^(?:about|on|regarding)\s+(.+)$", clean, re.I)
+    if m:
+        clean = m.group(1).strip()
+    return clean if clean else query
+
+
 # ── path detection ─────────────────────────────────────────────────────────────
 
 def _looks_like_path(text: str) -> bool:
@@ -461,7 +524,6 @@ def _looks_like_path(text: str) -> bool:
         return True
     if P(text).exists():
         return True
-    # Has extension and no spaces and not a question
     if "." in text and " " not in text and len(text) < 260 and not text.endswith("?"):
         ext = text.rsplit(".", 1)[-1].lower()
         if ext in ("pdf", "docx", "doc", "pptx", "ppt", "xlsx", "xls",

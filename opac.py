@@ -1,19 +1,21 @@
 """
-OPAC — Objective-driven Planning and Action Coordinator
-========================================================
-Main entry point. Run with:
-    python opac.py                 # interactive text mode
-    python opac.py --voice         # voice mode (Phase 3)
-    python opac.py --file FILE     # summarize a file directly
-    python opac.py --url URL       # summarize a URL directly
-    python opac.py --setup         # download and compile model for NPU
+OPAC -- Objective-driven Planning and Action Coordinator
+=========================================================
+Run with:
+    python opac.py                   # text mode (Phase 1+2+3.5)
+    python opac.py --voice           # voice mode (Phase 3)
+    python opac.py --voice-only      # fully hands-free voice mode
+    python opac.py --file FILE       # summarize a file
+    python opac.py --url URL         # summarize a URL
+    python opac.py --search TOPIC    # search Wikipedia
+    python opac.py --setup           # download and compile model
+    python opac.py --info            # show system status
 """
 
 import argparse
 import sys
 from pathlib import Path
 
-# Make sure our package is on the path
 sys.path.insert(0, str(Path(__file__).parent))
 
 from core.agent import OPACAgent
@@ -22,36 +24,7 @@ from utils.platform_info import print_system_info
 
 logger = get_logger("opac.main")
 
-
-def parse_args():
-    parser = argparse.ArgumentParser(
-        description="OPAC — Objective-driven Planning and Action Coordinator",
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="""
-Examples:
-  python opac.py                          Interactive mode
-  python opac.py --setup                  Download + compile model for NPU
-  python opac.py --file report.pdf        Summarize a PDF
-  python opac.py --file slides.pptx       Summarize a PowerPoint
-  python opac.py --url https://example.com Summarize a webpage
-  python opac.py --info                   Show system / NPU status
-        """
-    )
-    parser.add_argument("--setup",  action="store_true", help="Download and compile model for NPU (run once)")
-    parser.add_argument("--file",   type=str,            help="Path to a file to summarize")
-    parser.add_argument("--url",    type=str,            help="URL to summarize")
-    parser.add_argument("--voice",  action="store_true", help="Enable voice mode (Phase 3)")
-    parser.add_argument("--info",   action="store_true", help="Print system and NPU information")
-    parser.add_argument("--model",  type=str,            help="Override model name (default from config)")
-    parser.add_argument("--device", type=str,            default=None,
-                        help="Override inference device: NPU, GPU, CPU (default: NPU)")
-    return parser.parse_args()
-
-
-def main():
-    args = parse_args()
-
-    print(r"""
+BANNER = r"""
   ___  ____   _    ____
  / _ \|  _ \ / \  / ___|
 | | | | |_) / _ \| |
@@ -59,16 +32,37 @@ def main():
  \___/|_| /_/   \_\____|
 
  Objective-driven Planning and Action Coordinator
- Running fully on Intel NPU | Offline | Private
-""")
+ Phase 1+2+3+3.5  |  Intel NPU  |  Offline  |  Private
+"""
+
+
+def parse_args():
+    p = argparse.ArgumentParser(
+        description="OPAC -- Objective-driven Planning and Action Coordinator"
+    )
+    p.add_argument("--setup",      action="store_true", help="Download + compile model")
+    p.add_argument("--file",       type=str,            help="Summarize a file")
+    p.add_argument("--url",        type=str,            help="Summarize a URL")
+    p.add_argument("--search",     type=str,            help="Search Wikipedia")
+    p.add_argument("--voice",      action="store_true", help="Enable voice input+output")
+    p.add_argument("--voice-only", action="store_true", help="Fully hands-free voice mode")
+    p.add_argument("--info",       action="store_true", help="Print system info")
+    p.add_argument("--model",      type=str,            help="Override model name")
+    p.add_argument("--device",     type=str, default=None, help="Override device (NPU/GPU/CPU)")
+    return p.parse_args()
+
+
+def main():
+    args = parse_args()
+    print(BANNER)
 
     if args.info:
         print_system_info()
         return
 
     agent = OPACAgent(
-        model_override=args.model,
-        device_override=args.device,
+        model_override  = args.model,
+        device_override = args.device,
     )
 
     if args.setup:
@@ -76,26 +70,39 @@ def main():
         return
 
     if not agent.is_ready():
-        print("\n[OPAC] Model not found. Run 'python opac.py --setup' first.\n")
+        print("\n[OPAC] Model not found. Run: python opac.py --setup\n")
         sys.exit(1)
 
-    # --- one-shot modes ---
+    # One-shot modes
     if args.file:
+        agent.start()
         result = agent.summarize_file(args.file)
-        print("\n" + "═" * 60)
+        print("\n" + "=" * 60)
         print(result)
-        print("═" * 60 + "\n")
+        print("=" * 60 + "\n")
         return
 
     if args.url:
+        agent.start()
         result = agent.summarize_url(args.url)
-        print("\n" + "═" * 60)
+        print("\n" + "=" * 60)
         print(result)
-        print("═" * 60 + "\n")
+        print("=" * 60 + "\n")
         return
 
-    # --- interactive mode ---
-    agent.run_interactive()
+    if args.search:
+        agent.start()
+        agent._init_wiki()
+        agent._do_wiki_search(args.search)
+        return
+
+    # Voice-only mode (no keyboard)
+    if getattr(args, "voice_only", False):
+        agent.run_voice_mode()
+        return
+
+    # Interactive mode (with optional voice)
+    agent.run_interactive(voice=args.voice)
 
 
 if __name__ == "__main__":
