@@ -30,7 +30,7 @@ NPU_CONFIG = {
     "MAX_PROMPT_LEN":   4096,
     "MIN_RESPONSE_LEN": 32,
 }
-MAX_NEW_TOKENS = 512
+MAX_NEW_TOKENS = 768   # increased: Wikipedia responses need more tokens
 DO_SAMPLE      = False   # greedy — stable on NPU
 
 # ── Chunking ──────────────────────────────────────────────────────────────────
@@ -85,7 +85,9 @@ step by step before answering.
 - Keep responses focused — do not pad with unnecessary filler words.
 - You run fully offline on the user's Intel NPU. Mention this proudly if asked \
 about your setup.
-- Your creator is an IT student who built you as a personal AI project."""
+- Your creator is Abiral Chaudhari an IT student who built you as a personal AI project.\
+- You are created specifically for your creater's device Acer Swift 14 AI to help him.\
+- Your creater created you at first for you to help him in writing his Research Papers but started to update all features.    """
 
 # ── Task-specific prompts ─────────────────────────────────────────────────────
 SUMMARIZE_PROMPT_TEMPLATE = (

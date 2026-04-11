@@ -37,12 +37,16 @@ _GARBAGE_RE    = re.compile(r"\b(TokenName\w+|acleacle\w*|aphore\w*)\b")
 
 
 def _clean(text: str) -> str:
-    """Strip Qwen3 thinking blocks, garbage tokens, repeated junk."""
+    """Strip Qwen3 thinking blocks and garbage tokens from output."""
+    # Remove complete <think>...</think> blocks
     text = _THINK_RE.sub("", text)
+    # Remove unclosed <think>... blocks (model stopped mid-think)
     text = _THINK_OPEN_RE.sub("", text)
+    # Remove known garbage tokens
     text = _GARBAGE_RE.sub("", text)
-    # Detect degenerate repetition — if same 4+ char sequence repeats 10+ times, truncate
-    m = re.search(r"(.{4,}?)\1{10,}", text)
+    # Detect TRUE degenerate repetition — same 8+ char sequence repeats 20+ times
+    # (stricter than before — avoids false positives on structured LLM output)
+    m = re.search(r"(.{8,}?)\1{20,}", text)
     if m:
         text = text[:m.start()].strip()
         logger.warning("Degenerate repetition detected and truncated.")
@@ -167,26 +171,30 @@ class NPUEngine:
         max_new_tokens: int,
         streamer_callback: Optional[Callable[[str], None]],
     ) -> str:
-        """Raw generation — no chat session, just the prompt string."""
+        """Raw generation — no chat session, just the prompt string.
+
+        ALL tokens are streamed to screen immediately — including any <think>
+        content. The _clean() function removes think blocks from the stored
+        response after generation completes.
+
+        Why: suppressing think tokens during streaming caused blank output
+        because Qwen3 sometimes uses 200-300 tokens on thinking before
+        answering, leaving almost no room for the actual answer in MAX_NEW_TOKENS.
+        """
         cfg = self._make_gen_config(max_new_tokens)
 
         if streamer_callback is not None:
             collected: list[str] = []
-            in_think = [False]
 
             def _streamer(token: str) -> bool:
                 collected.append(token)
-                so_far = "".join(collected)
-                if "<think>" in so_far and not in_think[0]:
-                    in_think[0] = True
-                if in_think[0]:
-                    if "</think>" in so_far:
-                        in_think[0] = False
-                    return False
+                # Stream ALL tokens to screen immediately
+                # _clean() will remove <think> blocks from the stored result
                 streamer_callback(token)
                 return False
 
             self._pipeline.generate(prompt, cfg, _streamer)
+            # Clean the full collected text after generation
             return _clean("".join(collected))
         else:
             raw = self._pipeline.generate(prompt, cfg)
