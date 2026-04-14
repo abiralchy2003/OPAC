@@ -90,8 +90,22 @@ class STTEngine:
 
         print("  [OPAC] Listening ...", end="", flush=True)
 
+        # Use None to let sounddevice pick the system default input device.
+        # Passing device=-1 (sounddevice's uninitialised default) causes
+        # PortAudioError on some Windows configurations.
+        device = None
+        try:
+            sd.query_devices(kind='input')
+        except Exception:
+            # Find first available input device if default query fails
+            for i, d in enumerate(sd.query_devices()):
+                if d.get('max_input_channels', 0) > 0:
+                    device = i
+                    break
+
         with sd.InputStream(samplerate=RATE, channels=1,
-                            dtype="int16", blocksize=CHUNK) as stream:
+                            dtype="int16", blocksize=CHUNK,
+                            device=device) as stream:
             deadline = time.time() + timeout
             while time.time() < deadline:
                 data, _ = stream.read(CHUNK)
