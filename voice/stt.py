@@ -1,19 +1,19 @@
 """
 OPAC Speech-to-Text  (Phase 3)
 ================================
-Converts spoken audio to text using faster-whisper (CPU).
-The NPU stays free for LLM inference the whole time.
+Converts microphone audio to text using faster-whisper (CPU).
+
+Two modes:
+  listen()        — records until silence, then transcribes once
+  listen_live()   — transcribes in short rolling chunks and prints
+                    each partial result so user sees live feedback
 
 Install:
     pip install faster-whisper sounddevice numpy
-
-Usage:
-    stt = STTEngine()
-    stt.load()
-    text = stt.listen()
 """
 
 from __future__ import annotations
+
 import time
 from utils.logger import get_logger
 from config.settings import (
@@ -22,6 +22,24 @@ from config.settings import (
 )
 
 logger = get_logger("opac.voice.stt")
+
+
+def _get_input_device():
+    """Find working microphone. Returns None for system default."""
+    try:
+        import sounddevice as sd
+        sd.query_devices(kind='input')
+        return None
+    except Exception:
+        pass
+    try:
+        import sounddevice as sd
+        for i, d in enumerate(sd.query_devices()):
+            if d.get('max_input_channels', 0) > 0:
+                return i
+    except Exception:
+        pass
+    return None
 
 
 class STTEngine:
@@ -52,18 +70,116 @@ class STTEngine:
     def loaded(self) -> bool:
         return self._loaded
 
+    # ── main listen method ────────────────────────────────────────────────────
+
     def listen(self, timeout: float = 10.0) -> str:
         """
-        Record from microphone until MIC_SILENCE_TIMEOUT seconds of silence,
-        then transcribe with Whisper.
-        Returns transcribed string, or "" if nothing heard.
+        Record from microphone with LIVE transcription display.
+
+        Shows every chunk of speech as it is heard, so the user
+        can see exactly what OPAC is capturing in real time.
+        Waits for MIC_SILENCE_TIMEOUT seconds of silence to finish.
+        Returns the full transcription as a single string.
         """
         if not self._loaded:
             raise RuntimeError("Call stt.load() first.")
-        audio = self._record(timeout)
-        if audio is None:
+
+        try:
+            import sounddevice as sd
+            import numpy as np
+        except ImportError:
+            raise ImportError("pip install sounddevice numpy")
+
+        RATE           = 16000
+        CHUNK          = 4096          # ~0.25 s per chunk — good balance
+        device         = _get_input_device()
+        full_buffer    = []            # accumulates all audio
+        chunk_buffer   = []            # current speech burst
+        collecting     = False
+        silent         = 0.0
+        partial_texts  = []            # transcription of each burst
+
+        print("  [OPAC] Speak now (I'll show what I hear) ...", flush=True)
+        print("  [OPAC] You said: ", end="", flush=True)
+
+        try:
+            stream = sd.InputStream(
+                samplerate=RATE,
+                channels=1,
+                dtype="int16",
+                blocksize=CHUNK,
+                device=device,
+            )
+            stream.start()
+        except Exception as e:
+            logger.error(f"Cannot open microphone for STT: {e}")
+            print(f"\n  [OPAC] Mic error: {e}", flush=True)
             return ""
-        return self._transcribe(audio)
+
+        deadline = time.time() + timeout
+        try:
+            while time.time() < deadline:
+                try:
+                    data, _ = stream.read(CHUNK)
+                    energy  = float(abs(data).mean())
+                except Exception:
+                    time.sleep(0.05)
+                    continue
+
+                if energy > MIC_ENERGY_THRESHOLD:
+                    # Speech detected — start/continue collecting
+                    collecting = True
+                    silent     = 0.0
+                    chunk_buffer.append(data.copy())
+                    full_buffer.append(data.copy())
+
+                elif collecting:
+                    # Silence after speech
+                    chunk_buffer.append(data.copy())
+                    full_buffer.append(data.copy())
+                    silent += CHUNK / RATE
+
+                    if silent >= 0.6:
+                        # 0.6 s silence — transcribe what we have so far
+                        # and show it live, then keep listening
+                        burst = np.concatenate(chunk_buffer, axis=0)
+                        partial = self._transcribe(burst).strip()
+                        if partial:
+                            partial_texts.append(partial)
+                            print(partial + " ", end="", flush=True)
+                        chunk_buffer = []
+                        silent       = 0.0
+                        collecting   = False
+
+                    if silent >= MIC_SILENCE_TIMEOUT:
+                        # Full silence timeout — done listening
+                        break
+
+        finally:
+            try:
+                stream.stop()
+                stream.close()
+            except Exception:
+                pass
+
+        print()  # newline after live display
+
+        # Transcribe entire audio for the best final result
+        if not full_buffer:
+            return ""
+
+        import numpy as np
+        full_audio = np.concatenate(full_buffer, axis=0)
+        final_text = self._transcribe(full_audio).strip()
+        logger.info(f"STT final: '{final_text}'")
+
+        # Show correction if final differs from live display
+        if final_text:
+            live_combined = " ".join(partial_texts)
+            if final_text.lower() != live_combined.lower():
+                print(f"  [OPAC] (corrected) You said: {final_text}", flush=True)
+
+        return final_text
 
     def transcribe_file(self, path: str) -> str:
         """Transcribe an audio file directly (for testing)."""
@@ -74,67 +190,12 @@ class STTEngine:
 
     # ── internal ──────────────────────────────────────────────────────────────
 
-    def _record(self, timeout: float):
-        """Record microphone audio. Returns numpy array or None."""
-        try:
-            import sounddevice as sd
-            import numpy as np
-        except ImportError:
-            raise ImportError("pip install sounddevice numpy")
-
-        RATE   = 16000
-        CHUNK  = 1024
-        frames = []
-        silent = 0.0
-        speaking = False
-
-        print("  [OPAC] Listening ...", end="", flush=True)
-
-        # Use None to let sounddevice pick the system default input device.
-        # Passing device=-1 (sounddevice's uninitialised default) causes
-        # PortAudioError on some Windows configurations.
-        device = None
-        try:
-            sd.query_devices(kind='input')
-        except Exception:
-            # Find first available input device if default query fails
-            for i, d in enumerate(sd.query_devices()):
-                if d.get('max_input_channels', 0) > 0:
-                    device = i
-                    break
-
-        with sd.InputStream(samplerate=RATE, channels=1,
-                            dtype="int16", blocksize=CHUNK,
-                            device=device) as stream:
-            deadline = time.time() + timeout
-            while time.time() < deadline:
-                data, _ = stream.read(CHUNK)
-                energy  = abs(data).mean() if hasattr(data, "mean") else 0
-
-                if energy > MIC_ENERGY_THRESHOLD:
-                    speaking = True
-                    silent   = 0.0
-                    frames.append(data.copy())
-                elif speaking:
-                    frames.append(data.copy())
-                    silent += CHUNK / RATE
-                    if silent >= MIC_SILENCE_TIMEOUT:
-                        break
-
-        if not frames:
-            print(" (nothing heard)")
-            return None
-
-        import numpy as np
-        audio = np.concatenate(frames, axis=0)
-        duration = len(audio) / RATE
-        print(f" ({duration:.1f}s)")
-        return audio
-
     def _transcribe(self, audio) -> str:
+        """Transcribe a numpy int16 audio array."""
         import numpy as np
         audio_f32 = audio.flatten().astype(np.float32) / 32768.0
+        # Skip very short clips — Whisper hallucinates on <0.3 s of audio
+        if len(audio_f32) < 16000 * 0.3:
+            return ""
         segments, _ = self._model.transcribe(audio_f32, beam_size=5, language="en")
-        text = " ".join(seg.text.strip() for seg in segments).strip()
-        logger.info(f"STT: '{text}'")
-        return text
+        return " ".join(seg.text.strip() for seg in segments).strip()
