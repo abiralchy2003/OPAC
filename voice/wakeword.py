@@ -1,16 +1,9 @@
 """
 OPAC Wake Word Detection  (Phase 3)
 =====================================
-Fuzzy matching for "hey opac" since Whisper transcribes it as:
-  opec, o-back, oh back, heel back, here we're back, etc.
-
-Threshold raised to 0.72 to eliminate false positives like
-"mic open" -> "hi opec".
-
-After wake word triggers:
-  - Prints a clear visual indicator
-  - Plays a beep (Windows) or prints bell char
-  - Then listens for the actual command
+Key fix: wake word mic stream is PAUSED before command STT listens,
+then RESUMED after. Prevents mic conflict where wake word stream
+consumes audio meant for the user's command.
 """
 
 from __future__ import annotations
@@ -23,70 +16,39 @@ from config.settings import MIC_ENERGY_THRESHOLD
 
 logger = get_logger("opac.voice.wakeword")
 
-# Known Whisper transcriptions of "hey opac"
 WAKE_TRIGGERS = [
     "hey opac", "hey opec", "hey o-back", "hey o back", "hey oh back",
     "hey oh-back", "hey opak", "hi opac", "hi opec", "hello opac",
     "hello opec", "opac", "opec",
 ]
-
-# Raised from 0.55 to 0.72 — eliminates false positives
-# "mic open" vs "hi opec" = 0.67 → no longer triggers
-# "hello opec" vs "hello opac" = 0.92 → still triggers
-# "he'll be back" vs "hey o-back" = 0.74 → still triggers
-FUZZY_THRESHOLD = 0.72
-
-# Words that must NOT trigger the wake word even if they match
-# (safety guard for common words that happen to be similar)
-EXCLUSION_PATTERNS = [
-    "mic open", "microphone", "music", "movie", "become",
-]
+FUZZY_THRESHOLD      = 0.72
+WORD_FUZZY_THRESHOLD = 0.80
 
 
 def _is_wake_word(text: str) -> bool:
-    """Return True if text is likely the wake phrase."""
     t = text.lower().strip().rstrip(".")
-
-    # Exclusion check — some common phrases score high but are not wake words
-    for excl in EXCLUSION_PATTERNS:
-        if excl in t:
-            logger.debug(f"Wake word excluded: '{t}' contains '{excl}'")
-            return False
-
-    # Must be short enough to be a wake phrase (not a full sentence)
-    # Real commands go AFTER the wake word, not during it
     if len(t.split()) > 6:
         return False
-
-    # Exact substring match
     for trigger in WAKE_TRIGGERS:
         if trigger in t:
             logger.info(f"Wake word exact: '{trigger}' in '{t}'")
             return True
-
-    # Fuzzy match against full phrase
     for trigger in WAKE_TRIGGERS:
         ratio = difflib.SequenceMatcher(None, t, trigger).ratio()
         if ratio >= FUZZY_THRESHOLD:
             logger.info(f"Wake word fuzzy: '{t}' ~ '{trigger}' ({ratio:.2f})")
             return True
-
-    # Word-level: any single word similar to "opac"/"opec"
-    # Only if the utterance is 1-3 words (pure wake word, not a sentence)
     if len(t.split()) <= 3:
         for word in t.split():
             word = word.strip(".,!?")
             for variant in ["opac", "opec", "opak"]:
-                ratio = difflib.SequenceMatcher(None, word, variant).ratio()
-                if ratio >= 0.80:  # stricter for word-level
-                    logger.info(f"Wake word word-level: '{word}' ~ '{variant}' ({ratio:.2f})")
+                if difflib.SequenceMatcher(None, word, variant).ratio() >= WORD_FUZZY_THRESHOLD:
+                    logger.info(f"Wake word word: '{word}' ~ '{variant}'")
                     return True
-
     return False
 
 
 def _get_input_device():
-    """Find working microphone. Returns None for system default."""
     try:
         import sounddevice as sd
         sd.query_devices(kind='input')
@@ -104,17 +66,15 @@ def _get_input_device():
 
 
 def _alert():
-    """Visual + audio alert that wake word was detected and OPAC is listening."""
-    print("\n" + "=" * 50)
-    print("  [OPAC] Wake word detected! Listening for command ...")
-    print("=" * 50)
-    # Try to play a beep
+    print("\n" + "-" * 50, flush=True)
+    print("  [OPAC] Listening for your command ...", flush=True)
+    print("-" * 50, flush=True)
     try:
         import winsound
-        winsound.Beep(880, 200)   # 880Hz for 200ms
+        winsound.Beep(880, 200)
     except Exception:
         try:
-            print("\a", end="", flush=True)  # terminal bell
+            print("\a", end="", flush=True)
         except Exception:
             pass
 
@@ -125,6 +85,8 @@ class WakeWordDetector:
         self.stt      = stt_engine
         self._running = False
         self._thread  = None
+        self._stream  = None
+        self._paused  = False
 
     def start(self):
         self._running = True
@@ -137,6 +99,16 @@ class WakeWordDetector:
         if self._thread:
             self._thread.join(timeout=2)
 
+    def pause(self):
+        """Stop reading mic so command STT can use it exclusively."""
+        self._paused = True
+        logger.debug("Wake word paused")
+
+    def resume(self):
+        """Resume wake word listening after command STT finishes."""
+        self._paused = False
+        logger.debug("Wake word resumed")
+
     def _run(self):
         if self._try_openwakeword():
             return
@@ -147,18 +119,19 @@ class WakeWordDetector:
             import openwakeword
             from openwakeword.model import Model
             import sounddevice as sd
-            import numpy as np
         except ImportError:
             return False
         try:
-            oww = Model(wakeword_models=["hey_jarvis"], inference_framework="onnx")
-            logger.info("Wake word: openwakeword loaded.")
-            RATE, CHUNK = 16000, 1280
+            oww    = Model(wakeword_models=["hey_jarvis"], inference_framework="onnx")
             device = _get_input_device()
-            with sd.InputStream(samplerate=RATE, channels=1, dtype="int16",
-                                blocksize=CHUNK, device=device) as stream:
+            with sd.InputStream(samplerate=16000, channels=1, dtype="int16",
+                                blocksize=1280, device=device) as stream:
+                self._stream = stream
                 while self._running:
-                    audio, _ = stream.read(CHUNK)
+                    if self._paused:
+                        time.sleep(0.05)
+                        continue
+                    audio, _ = stream.read(1280)
                     for _, score in oww.predict(audio.flatten()).items():
                         if score > 0.5:
                             _alert()
@@ -172,7 +145,7 @@ class WakeWordDetector:
     def _run_simple_fallback(self):
         logger.info("Wake word: STT fallback (threshold=0.72)")
         if not self.stt or not self.stt.loaded:
-            logger.warning("STT not loaded — wake word unavailable")
+            logger.warning("STT not loaded")
             return
         try:
             import sounddevice as sd
@@ -183,10 +156,12 @@ class WakeWordDetector:
 
         device = _get_input_device()
         RATE, CHUNK = 16000, 1024
+
         try:
             stream = sd.InputStream(samplerate=RATE, channels=1, dtype="int16",
                                     blocksize=CHUNK, device=device)
             stream.start()
+            self._stream = stream
             logger.info(f"Wake word: mic open (device={device})")
         except Exception as e:
             logger.error(f"Cannot open microphone: {e}")
@@ -195,6 +170,12 @@ class WakeWordDetector:
         buffer, collecting, silent = [], False, 0.0
         try:
             while self._running:
+                if self._paused:
+                    # Clear buffer while paused — don't process stale audio
+                    buffer, collecting, silent = [], False, 0.0
+                    time.sleep(0.05)
+                    continue
+
                 try:
                     data, _ = stream.read(CHUNK)
                     energy  = float(abs(data).mean())
@@ -216,7 +197,7 @@ class WakeWordDetector:
                             if _is_wake_word(text):
                                 _alert()
                                 self.callback()
-                                time.sleep(1.5)  # debounce — don't re-trigger immediately
+                                time.sleep(1.5)
                         except Exception as e:
                             logger.debug(f"Wake error: {e}")
                         buffer, collecting, silent = [], False, 0.0
