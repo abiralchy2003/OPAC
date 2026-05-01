@@ -21,16 +21,15 @@ from utils.logger import get_logger
 
 logger = get_logger("opac.agent")
 
-# ── Intent patterns ────────────────────────────────────────────────────────────
-_INTENT_HELP   = re.compile(r"^(help|\?|commands)$", re.I)
-_INTENT_QUIT   = re.compile(r"^(quit|exit|bye|goodbye|q)$", re.I)
-_INTENT_INFO   = re.compile(r"^(info|status|device|version)$", re.I)
-_INTENT_OPEN   = re.compile(r"^(?:open|launch|start|run)\s+(.+)$", re.I)
-_INTENT_SUM    = re.compile(r"^(?:summarize|summarise|summary of|read|explain)\s+(.+)$", re.I)
-_INTENT_WIKI   = re.compile(r"^(?:search|look up|find|wiki|wikipedia)\s+(.+)$", re.I)
-_INTENT_VOICE  = re.compile(r"^voice\s*(on|off)$", re.I)
-_INTENT_CLEAR  = re.compile(r"^(clear|reset|forget|new chat)$", re.I)
-_INTENT_TONE   = re.compile(r"^(be|talk|speak)\s+(casual|formal|friendly|professional).*$", re.I)
+_INTENT_HELP  = re.compile(r"^(help|\?|commands)$", re.I)
+_INTENT_QUIT  = re.compile(r"^(quit|exit|bye|goodbye|q)$", re.I)
+_INTENT_INFO  = re.compile(r"^(info|status|device|version)$", re.I)
+_INTENT_OPEN  = re.compile(r"^(?:open|launch|start|run)\s+(.+)$", re.I)
+_INTENT_SUM   = re.compile(r"^(?:summarize|summarise|summary of|read|explain)\s+(.+)$", re.I)
+_INTENT_WIKI  = re.compile(r"^(?:search|look up|find|wiki|wikipedia)\s+(.+)$", re.I)
+_INTENT_VOICE = re.compile(r"^voice\s*(on|off)$", re.I)
+_INTENT_CLEAR = re.compile(r"^(clear|reset|forget|new chat)$", re.I)
+_INTENT_TONE  = re.compile(r"^(be|talk|speak)\s+(casual|formal|friendly|professional).*$", re.I)
 
 _CASUAL = re.compile(
     r"^(hi|hello|hey|how are you|what.?s up|good\s+(morning|afternoon|evening|night)|"
@@ -71,10 +70,9 @@ class OPACAgent:
         self._history: List[Dict] = []
         self._voice_active = False
         self._tone         = "auto"
-
-        self._stt      = None
-        self._tts      = None
-        self._wakeword = None
+        self._stt          = None
+        self._tts          = None
+        self._wakeword     = None
 
         self._wiki = None
         if WIKI_ENABLED:
@@ -98,7 +96,7 @@ class OPACAgent:
             self._wakeword.stop()
         self.engine.unload()
 
-    # ── Phase 3 — voice ────────────────────────────────────────────────────────
+    # ── voice ──────────────────────────────────────────────────────────────────
 
     def enable_voice(self) -> bool:
         try:
@@ -135,38 +133,57 @@ class OPACAgent:
 
     def _on_wake_word(self):
         """
-        Called from background wake word thread when wake phrase is detected.
-        Listens for the actual command, prints it, then routes it.
+        Called from background wake word thread.
+
+        CRITICAL: pause the wake word mic stream FIRST, then open STT mic,
+        then resume wake word. Without this, both streams compete for the
+        microphone and the command audio is never captured.
         """
         if not self._stt:
             return
 
-        # Audible + visual confirmation
-        self._tts_speak("Yes?")
-        print("\n" + "─" * 50, flush=True)
-        print("  [OPAC] Listening for your command ...", flush=True)
-        print("─" * 50, flush=True)
+        # 1. Pause wake word mic so command STT gets exclusive access
+        if self._wakeword:
+            self._wakeword.pause()
 
-        # Listen for the actual command
-        text = self._stt.listen(timeout=10.0)
+        # Small gap so the stream fully releases the mic buffer
+        import time
+        time.sleep(0.3)
+
+        # 2. Audible + visual confirmation
+        self._tts_speak("Yes?")
+        print("\n" + "-" * 50, flush=True)
+        print("  [OPAC] Listening for your command ...", flush=True)
+        print("-" * 50, flush=True)
+
+        # 3. Listen for the actual command with a fresh mic open
+        try:
+            text = self._stt.listen(timeout=10.0)
+        except Exception as e:
+            logger.error(f"STT listen error: {e}")
+            text = ""
+        finally:
+            # 4. Always resume wake word, even if STT failed
+            time.sleep(0.2)
+            if self._wakeword:
+                self._wakeword.resume()
 
         if not text.strip():
             print("  [OPAC] Nothing heard. Say 'hey opac' again to activate.\n",
                   flush=True)
-            # Reprint the input prompt
             print("  You: ", end="", flush=True)
             return
 
-        # Print what was heard so user can see it
+        # 5. Show what was heard
         print(f"\n  You (voice): {text}\n", flush=True)
 
-        # Route through normal input handler — same as if typed
+        # 6. Route through the normal input handler
         self._handle_input(text)
 
-        # Reprint the input prompt for next typed input
+        # 7. Reprint the input prompt
         print("  You: ", end="", flush=True)
 
-    # ── Phase 3.5 — Wikipedia ──────────────────────────────────────────────────
+    # ── Wikipedia ──────────────────────────────────────────────────────────────
 
     def _init_wiki(self):
         try:
@@ -187,7 +204,7 @@ class OPACAgent:
         return self.summarizer.summarize_url(url)
 
     def chat(self, query: str) -> str:
-        """Send message to LLM. Streams response to terminal. Returns full response."""
+        """Send message to LLM. Streams response to terminal."""
         self.start()
 
         tone_system    = self._build_tone_system(query)
@@ -209,14 +226,12 @@ class OPACAgent:
         print()
 
         response = "".join(collected).strip()
-
         if response:
             self._history.append({"role": "user",      "content": query})
             self._history.append({"role": "assistant",  "content": response})
             if len(self._history) > 20:
                 self._history = self._history[-20:]
             self._tts_speak(response)
-
         return response
 
     def _enrich_with_wiki(self, query: str) -> str:
@@ -296,7 +311,7 @@ class OPACAgent:
         self.stop()
 
     def run_voice_mode(self):
-        """Fully hands-free voice mode."""
+        """Fully hands-free mode."""
         if not self.enable_voice():
             print("  [OPAC] Cannot start voice mode -- libraries not installed.")
             return
@@ -304,7 +319,7 @@ class OPACAgent:
         self.enable_wake_word()
         print(f"\n  [OPAC] Voice mode active. Say '{WAKE_WORD}' to start.")
         print("  Press Ctrl+C to exit.\n")
-        self._tts_speak(f"Voice mode active. Say hey opac to talk to me.")
+        self._tts_speak("Voice mode active. Say hey opac to talk to me.")
         try:
             import time
             while True:
@@ -317,20 +332,17 @@ class OPACAgent:
     # ── router ─────────────────────────────────────────────────────────────────
 
     def _handle_input(self, user_input: str):
-        # 1. Greetings — straight to chat
         if _CASUAL.match(user_input.strip()):
             print("\n  OPAC: ", end="", flush=True)
             self.chat(user_input)
             print()
             return
 
-        # 2. Explicit Wikipedia search
         m = _INTENT_WIKI.match(user_input)
         if m:
             self._do_wiki_search(m.group(1).strip())
             return
 
-        # 3. URL
         url_match = re.search(r"https?://\S+", user_input)
         if url_match:
             url = url_match.group(0)
@@ -341,7 +353,6 @@ class OPACAgent:
                 self._tts_speak(result)
             return
 
-        # 4. File path
         clean = user_input.strip().strip('"').strip("'")
         if _looks_like_path(clean):
             print(f"\n  [OPAC] Summarising: {clean}")
@@ -351,7 +362,6 @@ class OPACAgent:
                 self._tts_speak(result)
             return
 
-        # 5. Summarize keyword
         m = _INTENT_SUM.match(user_input)
         if m:
             target = m.group(1).strip().strip('"').strip("'")
@@ -366,18 +376,16 @@ class OPACAgent:
                 self._tts_speak(result)
             return
 
-        # 6. Open app — Phase 5
         m = _INTENT_OPEN.match(user_input)
         if m:
             print(f"\n  OPAC: App launcher coming in Phase 5. (asked to open: '{m.group(1)}')\n")
             return
 
-        # 7. General chat with Wikipedia enrichment
         print("\n  OPAC: ", end="", flush=True)
         self.chat(user_input)
         print()
 
-    # ── Wikipedia search ───────────────────────────────────────────────────────
+    # ── Wikipedia ──────────────────────────────────────────────────────────────
 
     def _do_wiki_search(self, query: str):
         if not self._wiki or not self._wiki.available:
@@ -390,13 +398,14 @@ class OPACAgent:
         print(f"\n  [OPAC] Searching Wikipedia: '{topic}' ...")
         results = self._wiki.search(topic)
         if not results:
-            print(f"  [OPAC] No Wikipedia results for '{topic}' -- answering from knowledge ...\n")
+            print(f"  [OPAC] No Wikipedia results -- answering from knowledge ...\n")
             print("  OPAC: ", end="", flush=True)
             self.chat(f"Tell me about {topic}")
             print()
             return
         ctx    = self._wiki.format_context(results)
-        prompt = WIKI_CONTEXT_PROMPT.format(wiki_context=ctx, question=f"Tell me about {topic}")
+        prompt = WIKI_CONTEXT_PROMPT.format(wiki_context=ctx,
+                                            question=f"Tell me about {topic}")
         print(f"  [OPAC] Found {len(results)} article(s). Generating answer ...\n")
         print("  OPAC: ", end="", flush=True)
         collected = []
@@ -416,15 +425,11 @@ class OPACAgent:
 
     def _build_tone_system(self, user_message: str) -> str:
         if self._tone == "casual":
-            hint = (
-                "\n\nTone instruction: Be casual, warm, and friendly. "
-                "Use everyday language. You can be playful and light-hearted."
-            )
+            hint = ("\n\nTone instruction: Be casual, warm, and friendly. "
+                    "Use everyday language. Light humour is welcome.")
         elif self._tone in ("formal", "professional"):
-            hint = (
-                "\n\nTone instruction: Be precise, professional, and well-structured. "
-                "Use clear formal language."
-            )
+            hint = ("\n\nTone instruction: Be precise, professional, and well-structured. "
+                    "Use clear formal language.")
         else:
             hint = self._auto_detect_tone(user_message)
         return SYSTEM_PROMPT + hint
@@ -442,24 +447,16 @@ class OPACAgent:
         casual = len(casual_re.findall(text))
         formal = len(formal_re.findall(text))
         if casual > formal:
-            return (
-                "\n\nTone instruction: The user is casual and friendly -- "
-                "respond warmly and naturally, like a helpful friend."
-            )
+            return ("\n\nTone instruction: The user is casual -- "
+                    "respond warmly and naturally, like a helpful friend.")
         elif formal > casual:
-            return (
-                "\n\nTone instruction: The user is being formal -- "
-                "respond with precision and professionalism."
-            )
+            return ("\n\nTone instruction: The user is formal -- "
+                    "respond with precision and professionalism.")
         return ""
-
-    # ── TTS ────────────────────────────────────────────────────────────────────
 
     def _tts_speak(self, text: str) -> None:
         if self._voice_active and self._tts and self._tts.loaded:
             self._tts.speak(text)
-
-    # ── UI ─────────────────────────────────────────────────────────────────────
 
     def _print_help(self):
         print("""
@@ -480,10 +477,9 @@ class OPACAgent:
   |  quit / exit              Exit OPAC                           |
   +---------------------------------------------------------------+
 
-  Voice:
-    Say "hey opac" (or "hey opec" / "hello opac") to activate voice input.
-    After the beep and "Listening..." message, speak your command.
-    OPAC will transcribe it, show it on screen, then respond.
+  Voice: Say "hey opac" (or "opac", "hello opac") to activate.
+         After the beep + "Listening..." message, speak your command.
+         OPAC shows what it heard, then responds in text and speech.
 """)
 
     def _print_status(self):
