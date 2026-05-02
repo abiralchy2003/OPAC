@@ -1,13 +1,20 @@
 """
 OPAC Agent  (Phase 1 + 2 + 3 + 3.5)
+
+Thread safety fix: voice commands are queued to the main thread.
+pyttsx3 (Windows SAPI) and the NPU engine must run on the main thread.
+The wake word background thread only puts text into a queue.
+The main REPL loop drains the queue between keyboard inputs.
 """
 
 from __future__ import annotations
 
+import queue
 import re
-import sys
+import threading
+import time
 from pathlib import Path
-from typing import Optional, List, Dict
+from typing import List, Dict
 
 from config.settings import (
     DEFAULT_MODEL_DIR, INFERENCE_DEVICE,
@@ -74,6 +81,9 @@ class OPACAgent:
         self._tts          = None
         self._wakeword     = None
 
+        # Queue for voice commands from background thread -> main thread
+        self._voice_queue: queue.Queue = queue.Queue()
+
         self._wiki = None
         if WIKI_ENABLED:
             self._init_wiki()
@@ -133,26 +143,38 @@ class OPACAgent:
 
     def _on_voice_command(self, text: str):
         """
-        Called by WakeWordDetector after wake word + command are heard.
-        Receives the already-transcribed command text directly --
-        no second mic open needed.
+        Called from background wake word thread.
+        ONLY puts text into the queue -- does NOT process it here.
+        Processing happens on the main thread to avoid pyttsx3 / NPU
+        thread-safety issues.
         """
-        if not text or not text.strip():
-            print("  [OPAC] Nothing heard. Say 'hey opac' again.\n", flush=True)
+        if text and text.strip():
+            logger.info(f"Voice command queued: '{text}'")
+            self._voice_queue.put(text.strip())
+
+    def _drain_voice_queue(self):
+        """
+        Process all pending voice commands from the queue.
+        Called from the main thread inside the REPL loop.
+        """
+        while not self._voice_queue.empty():
+            try:
+                text = self._voice_queue.get_nowait()
+            except queue.Empty:
+                break
+
+            print(f"\n  You (voice): {text}\n", flush=True)
+
+            # Handle quit/exit from voice
+            if _INTENT_QUIT.match(text.strip()):
+                print("\n  OPAC: Goodbye! Take care.\n")
+                self._tts_speak("Goodbye! Take care.")
+                return "quit"
+
+            self._handle_input(text)
             print("  You: ", end="", flush=True)
-            return
 
-        # Show what was heard
-        print(f"\n  You (voice): {text}\n", flush=True)
-
-        # Speak acknowledgement
-        self._tts_speak("Got it.")
-
-        # Route through normal input handler
-        self._handle_input(text)
-
-        # Reprint input prompt
-        print("  You: ", end="", flush=True)
+        return None
 
     # ── Wikipedia ──────────────────────────────────────────────────────────────
 
@@ -232,13 +254,30 @@ class OPACAgent:
                 print(f"  [OPAC] Voice enabled  (TTS: {self._tts.backend})")
                 self.enable_wake_word()
 
+        import select, sys
+
         while True:
+            # ── drain any pending voice commands first ─────────────────────
+            result = self._drain_voice_queue()
+            if result == "quit":
+                break
+
+            # ── non-blocking keyboard check ────────────────────────────────
+            # Use input() normally but check voice queue every 0.2s
+            # so voice commands are not missed while waiting for keyboard
             try:
-                raw = input("  You: ").strip()
+                # On Windows, input() blocks — we use a thread to allow
+                # voice commands to interrupt
+                typed = self._input_with_voice_check("  You: ")
             except (EOFError, KeyboardInterrupt):
                 print("\n\n  [OPAC] Goodbye!\n")
                 break
 
+            if typed is None:
+                # Voice command was processed while waiting
+                continue
+
+            raw = typed.strip()
             if not raw:
                 continue
 
@@ -281,10 +320,47 @@ class OPACAgent:
 
         self.stop()
 
+    def _input_with_voice_check(self, prompt: str):
+        """
+        Show prompt and wait for keyboard input.
+        While waiting, also drain voice queue every 0.2 s.
+        Returns typed string, or None if a voice command was processed.
+        """
+        result_holder = [None]
+        done_event    = threading.Event()
+
+        def _read():
+            try:
+                result_holder[0] = input(prompt)
+            except (EOFError, KeyboardInterrupt):
+                result_holder[0] = "\x03"   # Ctrl+C sentinel
+            finally:
+                done_event.set()
+
+        t = threading.Thread(target=_read, daemon=True)
+        t.start()
+
+        while not done_event.is_set():
+            done_event.wait(timeout=0.2)
+            # Check voice queue while waiting for keyboard
+            if not self._voice_queue.empty():
+                result = self._drain_voice_queue()
+                if result == "quit":
+                    raise EOFError
+                # Voice command processed — but keyboard thread is still waiting
+                # Return None so REPL loop continues without a typed command
+                # The input thread will finish when user eventually presses Enter
+                return None
+
+        raw = result_holder[0]
+        if raw == "\x03":
+            raise KeyboardInterrupt
+        return raw
+
     def run_voice_mode(self):
-        """Fully hands-free mode."""
+        """Fully hands-free mode — no keyboard needed."""
         if not self.enable_voice():
-            print("  [OPAC] Cannot start voice mode -- libraries not installed.")
+            print("  [OPAC] Cannot start voice mode.")
             return
         self.start()
         self.enable_wake_word()
@@ -292,9 +368,11 @@ class OPACAgent:
         print("  Press Ctrl+C to exit.\n")
         self._tts_speak("Voice mode active. Say hey opac to talk to me.")
         try:
-            import time
             while True:
-                time.sleep(0.1)
+                result = self._drain_voice_queue()
+                if result == "quit":
+                    break
+                time.sleep(0.2)
         except KeyboardInterrupt:
             print("\n  [OPAC] Goodbye.\n")
         finally:
@@ -349,7 +427,7 @@ class OPACAgent:
 
         m = _INTENT_OPEN.match(user_input)
         if m:
-            print(f"\n  OPAC: App launcher coming in Phase 5. (asked to open: '{m.group(1)}')\n")
+            print(f"\n  OPAC: App launcher coming in Phase 5. (asked: '{m.group(1)}')\n")
             return
 
         print("\n  OPAC: ", end="", flush=True)
@@ -360,7 +438,7 @@ class OPACAgent:
 
     def _do_wiki_search(self, query: str):
         if not self._wiki or not self._wiki.available:
-            print("\n  [OPAC] Wikipedia not available. Run: pip install wikipedia-api\n")
+            print("\n  [OPAC] Wikipedia not available.\n")
             print("\n  OPAC: ", end="", flush=True)
             self.chat(f"Tell me about {query}")
             print()
@@ -397,32 +475,30 @@ class OPACAgent:
     def _build_tone_system(self, user_message: str) -> str:
         if self._tone == "casual":
             hint = ("\n\nTone instruction: Be casual, warm, and friendly. "
-                    "Use everyday language. Light humour is welcome.")
+                    "Use everyday language.")
         elif self._tone in ("formal", "professional"):
-            hint = ("\n\nTone instruction: Be precise, professional, and well-structured. "
-                    "Use clear formal language.")
+            hint = ("\n\nTone instruction: Be precise, professional, and structured.")
         else:
             hint = self._auto_detect_tone(user_message)
         return SYSTEM_PROMPT + hint
 
     def _auto_detect_tone(self, text: str) -> str:
         casual_re = re.compile(
-            r"\b(hey|hi|lol|haha|btw|tbh|ngl|omg|cool|awesome|wanna|gonna|"
-            r"gotta|kinda|sorta|ya|yep|nope|dunno|gimme|lemme|sup)\b", re.I
+            r"\b(hey|hi|lol|haha|btw|tbh|cool|awesome|wanna|gonna|"
+            r"kinda|ya|yep|nope|dunno|gimme|lemme|sup)\b", re.I
         )
         formal_re = re.compile(
             r"\b(please|could you|would you|kindly|regarding|furthermore|"
-            r"therefore|however|in addition|specifically|approximately|"
-            r"subsequently|consequently|nevertheless)\b", re.I
+            r"therefore|however|in addition|specifically)\b", re.I
         )
         casual = len(casual_re.findall(text))
         formal = len(formal_re.findall(text))
         if casual > formal:
-            return ("\n\nTone instruction: The user is casual -- "
-                    "respond warmly and naturally, like a helpful friend.")
+            return ("\n\nTone instruction: User is casual -- respond warmly, "
+                    "like a helpful friend.")
         elif formal > casual:
-            return ("\n\nTone instruction: The user is formal -- "
-                    "respond with precision and professionalism.")
+            return ("\n\nTone instruction: User is formal -- respond precisely "
+                    "and professionally.")
         return ""
 
     def _tts_speak(self, text: str) -> None:
@@ -434,38 +510,30 @@ class OPACAgent:
   +---------------------------------------------------------------+
   |  OPAC Commands                                                |
   +---------------------------------------------------------------+
-  |  <anything>               Chat freely -- ask anything         |
-  |  hello / hi               Start a conversation                |
+  |  <anything>               Chat freely                         |
   |  <file path>              Summarise a file                    |
   |  <URL>                    Summarise a web page                |
-  |  summarize <file/URL>     Summarise (keyword optional)        |
-  |  search <topic>           Search Wikipedia for a topic        |
-  |  voice on / voice off     Toggle spoken responses             |
-  |  be casual / be formal    Change conversation tone            |
+  |  summarize <file/URL>     Summarise with keyword              |
+  |  search <topic>           Search Wikipedia                    |
+  |  voice on / voice off     Toggle voice output                 |
+  |  be casual / be formal    Change tone                         |
   |  clear                    Clear conversation memory           |
-  |  info                     Show device and model status        |
+  |  info                     Show status                         |
   |  help                     Show this menu                      |
   |  quit / exit              Exit OPAC                           |
   +---------------------------------------------------------------+
-
-  Voice: Say "hey opac" (or "opac", "hello opac") to activate.
-         After the beep + "Listening..." message, speak your command.
-         OPAC shows what it heard, then responds in text and speech.
+  Voice: say "hey opac" -> beep -> speak command -> OPAC replies
 """)
 
     def _print_status(self):
-        model_ready  = "loaded" if self.engine.loaded else "not loaded"
-        wiki_ok      = "available" if (self._wiki and self._wiki.available) else "not available"
-        wiki_mode    = getattr(self._wiki, "_mode", "none") if self._wiki else "none"
-        voice_status = "on" if self._voice_active else "off"
         print(f"""
   Device    : {self.engine.device}
   Model     : {self.engine.model_dir.name}
-  Pipeline  : {model_ready}
-  Voice     : {voice_status}
-  Wikipedia : {wiki_ok} ({wiki_mode})
+  Pipeline  : {"loaded" if self.engine.loaded else "not loaded"}
+  Voice     : {"on" if self._voice_active else "off"}
+  Wikipedia : {"available" if (self._wiki and self._wiki.available) else "not available"}
   Tone      : {self._tone}
-  Memory    : {len(self._history)//2} turn(s) stored
+  Memory    : {len(self._history)//2} turn(s)
 """)
 
 
