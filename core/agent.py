@@ -123,7 +123,7 @@ class OPACAgent:
         try:
             from voice.wakeword import WakeWordDetector
             self._wakeword = WakeWordDetector(
-                callback=self._on_wake_word,
+                callback=self._on_voice_command,
                 stt_engine=self._stt,
             )
             self._wakeword.start()
@@ -131,56 +131,27 @@ class OPACAgent:
         except Exception as e:
             logger.error(f"Wake word init failed: {e}")
 
-    def _on_wake_word(self):
+    def _on_voice_command(self, text: str):
         """
-        Called from background wake word thread.
-
-        CRITICAL: pause the wake word mic stream FIRST, then open STT mic,
-        then resume wake word. Without this, both streams compete for the
-        microphone and the command audio is never captured.
+        Called by WakeWordDetector after wake word + command are heard.
+        Receives the already-transcribed command text directly --
+        no second mic open needed.
         """
-        if not self._stt:
-            return
-
-        # 1. Pause wake word mic so command STT gets exclusive access
-        if self._wakeword:
-            self._wakeword.pause()
-
-        # Small gap so the stream fully releases the mic buffer
-        import time
-        time.sleep(0.3)
-
-        # 2. Audible + visual confirmation
-        self._tts_speak("Yes?")
-        print("\n" + "-" * 50, flush=True)
-        print("  [OPAC] Listening for your command ...", flush=True)
-        print("-" * 50, flush=True)
-
-        # 3. Listen for the actual command with a fresh mic open
-        try:
-            text = self._stt.listen(timeout=10.0)
-        except Exception as e:
-            logger.error(f"STT listen error: {e}")
-            text = ""
-        finally:
-            # 4. Always resume wake word, even if STT failed
-            time.sleep(0.2)
-            if self._wakeword:
-                self._wakeword.resume()
-
-        if not text.strip():
-            print("  [OPAC] Nothing heard. Say 'hey opac' again to activate.\n",
-                  flush=True)
+        if not text or not text.strip():
+            print("  [OPAC] Nothing heard. Say 'hey opac' again.\n", flush=True)
             print("  You: ", end="", flush=True)
             return
 
-        # 5. Show what was heard
+        # Show what was heard
         print(f"\n  You (voice): {text}\n", flush=True)
 
-        # 6. Route through the normal input handler
+        # Speak acknowledgement
+        self._tts_speak("Got it.")
+
+        # Route through normal input handler
         self._handle_input(text)
 
-        # 7. Reprint the input prompt
+        # Reprint input prompt
         print("  You: ", end="", flush=True)
 
     # ── Wikipedia ──────────────────────────────────────────────────────────────
