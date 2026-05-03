@@ -1,10 +1,8 @@
 """
-OPAC Agent  (Phase 1 + 2 + 3 + 3.5)
-
-Thread safety fix: voice commands are queued to the main thread.
-pyttsx3 (Windows SAPI) and the NPU engine must run on the main thread.
-The wake word background thread only puts text into a queue.
-The main REPL loop drains the queue between keyboard inputs.
+OPAC Agent  (Phase 1 + 2 + 3 + 3.5 + 4 + 5)
+==============================================
+Phase 4: Browser tab summarisation
+Phase 5: App launcher
 """
 
 from __future__ import annotations
@@ -20,6 +18,7 @@ from config.settings import (
     DEFAULT_MODEL_DIR, INFERENCE_DEVICE,
     VOICE_ENABLED, WAKE_WORD,
     WIKI_ENABLED, WIKI_CONTEXT_PROMPT,
+    BROWSER_SUMMARIZE_PROMPT, BROWSER_MAX_CHARS,
     SYSTEM_PROMPT,
 )
 from core.npu_engine import NPUEngine
@@ -28,15 +27,31 @@ from utils.logger import get_logger
 
 logger = get_logger("opac.agent")
 
-_INTENT_HELP  = re.compile(r"^(help|\?|commands)$", re.I)
-_INTENT_QUIT  = re.compile(r"^(quit|exit|bye|goodbye|q)$", re.I)
-_INTENT_INFO  = re.compile(r"^(info|status|device|version)$", re.I)
-_INTENT_OPEN  = re.compile(r"^(?:open|launch|start|run)\s+(.+)$", re.I)
-_INTENT_SUM   = re.compile(r"^(?:summarize|summarise|summary of|read|explain)\s+(.+)$", re.I)
-_INTENT_WIKI  = re.compile(r"^(?:search|look up|find|wiki|wikipedia)\s+(.+)$", re.I)
-_INTENT_VOICE = re.compile(r"^voice\s*(on|off)$", re.I)
-_INTENT_CLEAR = re.compile(r"^(clear|reset|forget|new chat)$", re.I)
-_INTENT_TONE  = re.compile(r"^(be|talk|speak)\s+(casual|formal|friendly|professional).*$", re.I)
+# ── Intent patterns ────────────────────────────────────────────────────────────
+_INTENT_HELP    = re.compile(r"^(help|\?|commands)$", re.I)
+_INTENT_QUIT    = re.compile(r"^(quit|exit|bye|goodbye|q)$", re.I)
+_INTENT_INFO    = re.compile(r"^(info|status|device|version)$", re.I)
+_INTENT_CLEAR   = re.compile(r"^(clear|reset|forget|new chat)$", re.I)
+_INTENT_TONE    = re.compile(r"^(be|talk|speak)\s+(casual|formal|friendly|professional).*$", re.I)
+_INTENT_VOICE   = re.compile(r"^voice\s*(on|off)$", re.I)
+_INTENT_WIKI    = re.compile(r"^(?:search|look up|find|wiki|wikipedia)\s+(.+)$", re.I)
+_INTENT_SUM     = re.compile(r"^(?:summarize|summarise|summary of|read|explain)\s+(.+)$", re.I)
+
+# Phase 4 — browser tab
+_INTENT_TAB     = re.compile(
+    r"^(?:summarize|summarise|read|what is|what'?s on|explain)\s+"
+    r"(?:this\s+)?(?:tab|page|browser|current tab|current page|website|site|article)$",
+    re.I
+)
+_INTENT_TAB2    = re.compile(
+    r"^(?:tab|page|browser)\s+(?:summary|summarize|summarise)$", re.I
+)
+
+# Phase 5 — app launcher
+_INTENT_OPEN    = re.compile(
+    r"^(?:open|launch|start|run|load)\s+(.+)$", re.I
+)
+_INTENT_APPS    = re.compile(r"^(?:list apps?|show apps?|what apps?|available apps?).*$", re.I)
 
 _CASUAL = re.compile(
     r"^(hi|hello|hey|how are you|what.?s up|good\s+(morning|afternoon|evening|night)|"
@@ -80,10 +95,15 @@ class OPACAgent:
         self._stt          = None
         self._tts          = None
         self._wakeword     = None
-
-        # Queue for voice commands from background thread -> main thread
         self._voice_queue: queue.Queue = queue.Queue()
 
+        # Phase 4 — browser
+        self._browser = None
+
+        # Phase 5 — launcher
+        self._launcher = None
+
+        # Phase 3.5 — Wikipedia
         self._wiki = None
         if WIKI_ENABLED:
             self._init_wiki()
@@ -106,7 +126,7 @@ class OPACAgent:
             self._wakeword.stop()
         self.engine.unload()
 
-    # ── voice ──────────────────────────────────────────────────────────────────
+    # ── Phase 3 — voice ────────────────────────────────────────────────────────
 
     def enable_voice(self) -> bool:
         try:
@@ -119,12 +139,11 @@ class OPACAgent:
                 self._tts = TTSEngine()
                 self._tts.load()
             self._voice_active = True
-            logger.info(f"Voice enabled -- STT: Whisper, TTS: {self._tts.backend}")
+            logger.info(f"Voice enabled -- TTS: {self._tts.backend}")
             return True
         except Exception as e:
             logger.error(f"Voice init failed: {e}")
-            print(f"\n  [OPAC] Voice not available: {e}")
-            print("  Install: pip install faster-whisper sounddevice pyttsx3 numpy\n")
+            print(f"\n  [OPAC] Voice not available: {e}\n")
             return False
 
     def enable_wake_word(self):
@@ -142,41 +161,28 @@ class OPACAgent:
             logger.error(f"Wake word init failed: {e}")
 
     def _on_voice_command(self, text: str):
-        """
-        Called from background wake word thread.
-        ONLY puts text into the queue -- does NOT process it here.
-        Processing happens on the main thread to avoid pyttsx3 / NPU
-        thread-safety issues.
-        """
+        """Background thread — only queues text, never processes it."""
         if text and text.strip():
             logger.info(f"Voice command queued: '{text}'")
             self._voice_queue.put(text.strip())
 
     def _drain_voice_queue(self):
-        """
-        Process all pending voice commands from the queue.
-        Called from the main thread inside the REPL loop.
-        """
+        """Main thread — process all queued voice commands."""
         while not self._voice_queue.empty():
             try:
                 text = self._voice_queue.get_nowait()
             except queue.Empty:
                 break
-
             print(f"\n  You (voice): {text}\n", flush=True)
-
-            # Handle quit/exit from voice
             if _INTENT_QUIT.match(text.strip()):
                 print("\n  OPAC: Goodbye! Take care.\n")
                 self._tts_speak("Goodbye! Take care.")
                 return "quit"
-
             self._handle_input(text)
             print("  You: ", end="", flush=True)
-
         return None
 
-    # ── Wikipedia ──────────────────────────────────────────────────────────────
+    # ── Phase 3.5 — Wikipedia ──────────────────────────────────────────────────
 
     def _init_wiki(self):
         try:
@@ -185,6 +191,78 @@ class OPACAgent:
             self._wiki.setup()
         except Exception as e:
             logger.debug(f"Wikipedia init: {e}")
+
+    # ── Phase 4 — Browser ──────────────────────────────────────────────────────
+
+    def _init_browser(self):
+        if self._browser is None:
+            from actions.browser import BrowserEngine
+            self._browser = BrowserEngine()
+
+    def _summarize_current_tab(self) -> str:
+        """Grab current browser tab and summarise it."""
+        self._init_browser()
+        print("\n  [OPAC] Grabbing current browser tab ...", flush=True)
+        try:
+            url, text = self._browser.get_current_tab()
+        except RuntimeError as e:
+            return str(e)
+        except Exception as e:
+            return f"Browser error: {e}"
+
+        if not text.strip():
+            return "The page appears to be empty or could not be read."
+
+        # Truncate to limit
+        if len(text) > BROWSER_MAX_CHARS:
+            text = text[:BROWSER_MAX_CHARS]
+            print(f"  [OPAC] Page truncated to {BROWSER_MAX_CHARS} chars", flush=True)
+
+        print(f"  [OPAC] Page: {url}")
+        print(f"  [OPAC] Content: {len(text)} chars — summarising ...\n")
+
+        prompt = BROWSER_SUMMARIZE_PROMPT.format(url=url, content=text)
+        print("  OPAC: ", end="", flush=True)
+
+        collected = []
+        def _cb(tok):
+            collected.append(tok)
+            print(tok, end="", flush=True)
+            return False
+
+        self.engine._generate_chat(
+            user_message=prompt,
+            streamer_callback=_cb,
+        )
+        print("\n")
+        response = "".join(collected).strip()
+        self._tts_speak(response)
+        if response:
+            self._history.append({"role": "user",      "content": f"Summarise {url}"})
+            self._history.append({"role": "assistant",  "content": response})
+        return response
+
+    # ── Phase 5 — App Launcher ────────────────────────────────────────────────
+
+    def _init_launcher(self):
+        if self._launcher is None:
+            from actions.launcher import AppLauncher
+            self._launcher = AppLauncher()
+            print("  [OPAC] App launcher ready\n", flush=True)
+
+    def _open_app(self, app_name: str) -> str:
+        """Find and launch an application."""
+        self._init_launcher()
+        print(f"\n  [OPAC] Looking for '{app_name}' ...", flush=True)
+        success, message = self._launcher.open(app_name)
+        self._tts_speak(message)
+        return message
+
+    def _list_apps(self) -> str:
+        """List all launchable apps."""
+        self._init_launcher()
+        _, message = self._launcher.list_apps()
+        return message
 
     # ── public API ─────────────────────────────────────────────────────────────
 
@@ -197,9 +275,7 @@ class OPACAgent:
         return self.summarizer.summarize_url(url)
 
     def chat(self, query: str) -> str:
-        """Send message to LLM. Streams response to terminal."""
         self.start()
-
         tone_system    = self._build_tone_system(query)
         enriched_query = self._enrich_with_wiki(query)
         recent         = self._history[-6:] if self._history else None
@@ -217,7 +293,6 @@ class OPACAgent:
             streamer_callback=_cb,
         )
         print()
-
         response = "".join(collected).strip()
         if response:
             self._history.append({"role": "user",      "content": query})
@@ -237,10 +312,10 @@ class OPACAgent:
         if not results:
             return query
         ctx = self._wiki.format_context(results)
-        logger.info(f"Wikipedia context injected: topic='{topic}' ({len(results)} results)")
+        logger.info(f"Wikipedia: '{topic}' ({len(results)} results)")
         return WIKI_CONTEXT_PROMPT.format(wiki_context=ctx, question=query)
 
-    # ── interactive REPL ───────────────────────────────────────────────────────
+    # ── REPL ───────────────────────────────────────────────────────────────────
 
     def run_interactive(self, voice: bool = False):
         print("\n  Type anything to chat, paste a file path, or a URL.")
@@ -254,27 +329,18 @@ class OPACAgent:
                 print(f"  [OPAC] Voice enabled  (TTS: {self._tts.backend})")
                 self.enable_wake_word()
 
-        import select, sys
-
         while True:
-            # ── drain any pending voice commands first ─────────────────────
             result = self._drain_voice_queue()
             if result == "quit":
                 break
 
-            # ── non-blocking keyboard check ────────────────────────────────
-            # Use input() normally but check voice queue every 0.2s
-            # so voice commands are not missed while waiting for keyboard
             try:
-                # On Windows, input() blocks — we use a thread to allow
-                # voice commands to interrupt
                 typed = self._input_with_voice_check("  You: ")
             except (EOFError, KeyboardInterrupt):
                 print("\n\n  [OPAC] Goodbye!\n")
                 break
 
             if typed is None:
-                # Voice command was processed while waiting
                 continue
 
             raw = typed.strip()
@@ -321,11 +387,6 @@ class OPACAgent:
         self.stop()
 
     def _input_with_voice_check(self, prompt: str):
-        """
-        Show prompt and wait for keyboard input.
-        While waiting, also drain voice queue every 0.2 s.
-        Returns typed string, or None if a voice command was processed.
-        """
         result_holder = [None]
         done_event    = threading.Event()
 
@@ -333,7 +394,7 @@ class OPACAgent:
             try:
                 result_holder[0] = input(prompt)
             except (EOFError, KeyboardInterrupt):
-                result_holder[0] = "\x03"   # Ctrl+C sentinel
+                result_holder[0] = "\x03"
             finally:
                 done_event.set()
 
@@ -342,14 +403,10 @@ class OPACAgent:
 
         while not done_event.is_set():
             done_event.wait(timeout=0.2)
-            # Check voice queue while waiting for keyboard
             if not self._voice_queue.empty():
                 result = self._drain_voice_queue()
                 if result == "quit":
                     raise EOFError
-                # Voice command processed — but keyboard thread is still waiting
-                # Return None so REPL loop continues without a typed command
-                # The input thread will finish when user eventually presses Enter
                 return None
 
         raw = result_holder[0]
@@ -358,7 +415,6 @@ class OPACAgent:
         return raw
 
     def run_voice_mode(self):
-        """Fully hands-free mode — no keyboard needed."""
         if not self.enable_voice():
             print("  [OPAC] Cannot start voice mode.")
             return
@@ -381,17 +437,43 @@ class OPACAgent:
     # ── router ─────────────────────────────────────────────────────────────────
 
     def _handle_input(self, user_input: str):
+        # 1. Greetings
         if _CASUAL.match(user_input.strip()):
             print("\n  OPAC: ", end="", flush=True)
             self.chat(user_input)
             print()
             return
 
+        # 2. Phase 4 — browser tab
+        if _INTENT_TAB.match(user_input.strip()) or _INTENT_TAB2.match(user_input.strip()):
+            self.start()
+            self._summarize_current_tab()
+            return
+
+        # 3. Phase 5 — list apps
+        if _INTENT_APPS.match(user_input.strip()):
+            result = self._list_apps()
+            print(result)
+            return
+
+        # 4. Phase 5 — open app
+        m = _INTENT_OPEN.match(user_input)
+        if m:
+            app_name = m.group(1).strip()
+            # Don't treat file paths as app names
+            if not _looks_like_path(app_name) and not app_name.startswith("http"):
+                self.start()
+                result = self._open_app(app_name)
+                print(f"\n  OPAC: {result}\n")
+                return
+
+        # 5. Wikipedia explicit search
         m = _INTENT_WIKI.match(user_input)
         if m:
             self._do_wiki_search(m.group(1).strip())
             return
 
+        # 6. URL
         url_match = re.search(r"https?://\S+", user_input)
         if url_match:
             url = url_match.group(0)
@@ -402,6 +484,7 @@ class OPACAgent:
                 self._tts_speak(result)
             return
 
+        # 7. File path
         clean = user_input.strip().strip('"').strip("'")
         if _looks_like_path(clean):
             print(f"\n  [OPAC] Summarising: {clean}")
@@ -411,6 +494,7 @@ class OPACAgent:
                 self._tts_speak(result)
             return
 
+        # 8. Summarize keyword
         m = _INTENT_SUM.match(user_input)
         if m:
             target = m.group(1).strip().strip('"').strip("'")
@@ -425,11 +509,7 @@ class OPACAgent:
                 self._tts_speak(result)
             return
 
-        m = _INTENT_OPEN.match(user_input)
-        if m:
-            print(f"\n  OPAC: App launcher coming in Phase 5. (asked: '{m.group(1)}')\n")
-            return
-
+        # 9. General chat
         print("\n  OPAC: ", end="", flush=True)
         self.chat(user_input)
         print()
@@ -438,7 +518,7 @@ class OPACAgent:
 
     def _do_wiki_search(self, query: str):
         if not self._wiki or not self._wiki.available:
-            print("\n  [OPAC] Wikipedia not available.\n")
+            print("\n  [OPAC] Wikipedia not available. Run: pip install wikipedia-api\n")
             print("\n  OPAC: ", end="", flush=True)
             self.chat(f"Tell me about {query}")
             print()
@@ -447,15 +527,16 @@ class OPACAgent:
         print(f"\n  [OPAC] Searching Wikipedia: '{topic}' ...")
         results = self._wiki.search(topic)
         if not results:
-            print(f"  [OPAC] No Wikipedia results -- answering from knowledge ...\n")
+            print(f"  [OPAC] No results -- answering from knowledge ...\n")
             print("  OPAC: ", end="", flush=True)
             self.chat(f"Tell me about {topic}")
             print()
             return
+        from config.settings import WIKI_CONTEXT_PROMPT
         ctx    = self._wiki.format_context(results)
         prompt = WIKI_CONTEXT_PROMPT.format(wiki_context=ctx,
                                             question=f"Tell me about {topic}")
-        print(f"  [OPAC] Found {len(results)} article(s). Generating answer ...\n")
+        print(f"  [OPAC] Found {len(results)} article(s) ...\n")
         print("  OPAC: ", end="", flush=True)
         collected = []
         def _cb(tok):
@@ -472,33 +553,26 @@ class OPACAgent:
 
     # ── tone ───────────────────────────────────────────────────────────────────
 
-    def _build_tone_system(self, user_message: str) -> str:
+    def _build_tone_system(self, msg: str) -> str:
         if self._tone == "casual":
-            hint = ("\n\nTone instruction: Be casual, warm, and friendly. "
-                    "Use everyday language.")
+            hint = "\n\nTone: Be casual, warm, and friendly."
         elif self._tone in ("formal", "professional"):
-            hint = ("\n\nTone instruction: Be precise, professional, and structured.")
+            hint = "\n\nTone: Be precise and professional."
         else:
-            hint = self._auto_detect_tone(user_message)
+            hint = self._auto_detect_tone(msg)
         return SYSTEM_PROMPT + hint
 
     def _auto_detect_tone(self, text: str) -> str:
-        casual_re = re.compile(
-            r"\b(hey|hi|lol|haha|btw|tbh|cool|awesome|wanna|gonna|"
-            r"kinda|ya|yep|nope|dunno|gimme|lemme|sup)\b", re.I
-        )
-        formal_re = re.compile(
-            r"\b(please|could you|would you|kindly|regarding|furthermore|"
-            r"therefore|however|in addition|specifically)\b", re.I
-        )
-        casual = len(casual_re.findall(text))
-        formal = len(formal_re.findall(text))
+        casual = len(re.findall(
+            r"\b(hey|hi|lol|haha|btw|cool|awesome|wanna|gonna|kinda|ya|yep|nope|dunno)\b",
+            text, re.I))
+        formal = len(re.findall(
+            r"\b(please|could you|would you|kindly|regarding|furthermore|therefore)\b",
+            text, re.I))
         if casual > formal:
-            return ("\n\nTone instruction: User is casual -- respond warmly, "
-                    "like a helpful friend.")
+            return "\n\nTone: User is casual -- respond warmly, like a helpful friend."
         elif formal > casual:
-            return ("\n\nTone instruction: User is formal -- respond precisely "
-                    "and professionally.")
+            return "\n\nTone: User is formal -- respond precisely and professionally."
         return ""
 
     def _tts_speak(self, text: str) -> None:
@@ -510,28 +584,55 @@ class OPACAgent:
   +---------------------------------------------------------------+
   |  OPAC Commands                                                |
   +---------------------------------------------------------------+
-  |  <anything>               Chat freely                         |
-  |  <file path>              Summarise a file                    |
-  |  <URL>                    Summarise a web page                |
-  |  summarize <file/URL>     Summarise with keyword              |
-  |  search <topic>           Search Wikipedia                    |
-  |  voice on / voice off     Toggle voice output                 |
-  |  be casual / be formal    Change tone                         |
-  |  clear                    Clear conversation memory           |
-  |  info                     Show status                         |
-  |  help                     Show this menu                      |
-  |  quit / exit              Exit OPAC                           |
+  |  CONVERSATION                                                 |
+  |    <anything>             Chat freely                         |
+  |    be casual / be formal  Change tone                         |
+  |    clear                  Clear memory                        |
+  |                                                               |
+  |  DOCUMENTS & WEB                                             |
+  |    <file path>            Summarise a file                    |
+  |    <URL>                  Summarise a web page                |
+  |    summarize <file/URL>   Summarise with keyword              |
+  |    search <topic>         Search Wikipedia                    |
+  |                                                               |
+  |  PHASE 4 - BROWSER                                           |
+  |    summarize tab          Summarise current browser tab       |
+  |    summarize page         Same as above                       |
+  |    what is this page      Same as above                       |
+  |                                                               |
+  |  PHASE 5 - APP LAUNCHER                                      |
+  |    open <app>             Open any installed app              |
+  |    launch <app>           Same as above                       |
+  |    list apps              Show all launchable apps            |
+  |    Examples:                                                  |
+  |      open chrome          open vs code                        |
+  |      open spotify         open notepad                        |
+  |      launch discord       start calculator                    |
+  |                                                               |
+  |  VOICE                                                        |
+  |    voice on / voice off   Toggle voice output                 |
+  |    Say "hey opac"         Activate voice input                |
+  |                                                               |
+  |  SYSTEM                                                       |
+  |    info                   Show status                         |
+  |    help                   Show this menu                      |
+  |    quit / exit            Exit OPAC                           |
   +---------------------------------------------------------------+
-  Voice: say "hey opac" -> beep -> speak command -> OPAC replies
 """)
 
     def _print_status(self):
+        wiki_ok  = "available" if (self._wiki and self._wiki.available) else "not available"
+        wiki_mode = getattr(self._wiki, "_mode", "none") if self._wiki else "none"
+        browser_ok = "ready" if self._browser else "not initialised (auto-loads on use)"
+        launcher_ok = "ready" if self._launcher else "not initialised (auto-loads on use)"
         print(f"""
   Device    : {self.engine.device}
   Model     : {self.engine.model_dir.name}
   Pipeline  : {"loaded" if self.engine.loaded else "not loaded"}
   Voice     : {"on" if self._voice_active else "off"}
-  Wikipedia : {"available" if (self._wiki and self._wiki.available) else "not available"}
+  Wikipedia : {wiki_ok} ({wiki_mode})
+  Browser   : {browser_ok}
+  Launcher  : {launcher_ok}
   Tone      : {self._tone}
   Memory    : {len(self._history)//2} turn(s)
 """)
