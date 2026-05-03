@@ -25,7 +25,7 @@ logger = get_logger("opac.voice.wakeword")
 WAKE_TRIGGERS = [
     "hey opac", "hey opec", "hey o-back", "hey o back", "hey oh back",
     "hey oh-back", "hey opak", "hi opac", "hi opec", "hello opac",
-    "hello opec", "opac", "opec", "hello robo",
+    "hello opec", "opac", "opec",
 ]
 FUZZY_THRESHOLD      = 0.72
 WORD_FUZZY_THRESHOLD = 0.80
