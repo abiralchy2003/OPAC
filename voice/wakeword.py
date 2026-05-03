@@ -1,14 +1,14 @@
 """
 OPAC Wake Word Detection  (Phase 3)
 =====================================
-Single microphone stream architecture:
-  - ONE stream reads mic audio continuously
-  - Wake word detection runs on that stream
-  - When wake word detected, the same stream is handed to the
-    command listener — NO second stream opened, NO mic conflict
+Single-stream architecture — one mic stream for everything.
 
-This fixes the Windows exclusive-mode mic conflict where
-pause + reopen caused stt.listen() to fail silently.
+Key behaviours:
+  - Fuzzy matching catches Whisper mishearing "hey opac"
+  - After a command is processed, OPAC enters FOLLOW-UP mode:
+    listens for the next command for up to 8 seconds without
+    needing the wake word again. Only returns to wake word
+    detection after 8 seconds of silence.
 """
 
 from __future__ import annotations
@@ -22,38 +22,53 @@ from config.settings import MIC_ENERGY_THRESHOLD
 
 logger = get_logger("opac.voice.wakeword")
 
+# What Whisper transcribes "hey opac" as — only real variants, no false positives
 WAKE_TRIGGERS = [
     "hey opac", "hey opec", "hey o-back", "hey o back", "hey oh back",
     "hey oh-back", "hey opak", "hi opac", "hi opec", "hello opac",
-    "hello opec", "opac", "opec",
+    "hello opec", "opac", "opec", "cook", "let's cook", "hello",
 ]
-FUZZY_THRESHOLD      = 0.72
-WORD_FUZZY_THRESHOLD = 0.80
+
+FUZZY_THRESHOLD      = 0.72   # full-phrase similarity
+WORD_FUZZY_THRESHOLD = 0.80   # single-word similarity (stricter)
 
 RATE  = 16000
 CHUNK = 1024
 
+# How long to stay in follow-up mode after a command (seconds)
+# During this time, anything you say is treated as a command without wake word
+FOLLOWUP_TIMEOUT = 8.0
+
 
 def _is_wake_word(text: str) -> bool:
-    t = text.lower().strip().rstrip(".")
-    if len(t.split()) > 6:
+    t = text.lower().strip().rstrip(".!")
+
+    # Must be short — real commands come AFTER the wake word, not during it
+    if len(t.split()) > 5:
         return False
+
+    # Exact substring
     for trigger in WAKE_TRIGGERS:
         if trigger in t:
             logger.info(f"Wake word exact: '{trigger}' in '{t}'")
             return True
+
+    # Fuzzy full-phrase
     for trigger in WAKE_TRIGGERS:
         ratio = difflib.SequenceMatcher(None, t, trigger).ratio()
         if ratio >= FUZZY_THRESHOLD:
             logger.info(f"Wake word fuzzy: '{t}' ~ '{trigger}' ({ratio:.2f})")
             return True
+
+    # Word-level — only for very short utterances (1-3 words)
     if len(t.split()) <= 3:
         for word in t.split():
-            word = word.strip(".,!?")
+            word = word.strip(".,!?'")
             for variant in ["opac", "opec", "opak"]:
                 if difflib.SequenceMatcher(None, word, variant).ratio() >= WORD_FUZZY_THRESHOLD:
                     logger.info(f"Wake word word: '{word}' ~ '{variant}'")
                     return True
+
     return False
 
 
@@ -75,12 +90,13 @@ def _get_input_device():
 
 
 def _alert():
+    """Beep + visual indicator."""
     print("\n" + "-" * 50, flush=True)
-    print("  [OPAC] Wake word detected! Speak your command ...", flush=True)
+    print("  [OPAC] Listening ...", flush=True)
     print("-" * 50, flush=True)
     try:
         import winsound
-        winsound.Beep(880, 200)
+        winsound.Beep(880, 150)
     except Exception:
         try:
             print("\a", end="", flush=True)
@@ -89,7 +105,6 @@ def _alert():
 
 
 def _transcribe(model, audio: np.ndarray) -> str:
-    """Transcribe int16 numpy array using the loaded Whisper model."""
     if audio is None or len(audio) < RATE * 0.3:
         return ""
     audio_f32 = audio.flatten().astype(np.float32) / 32768.0
@@ -108,14 +123,14 @@ class WakeWordDetector:
         self._running = True
         self._thread  = threading.Thread(target=self._run, daemon=True)
         self._thread.start()
-        logger.info("Wake word detector started (single-stream mode)")
+        logger.info("Wake word detector started (follow-up mode enabled)")
 
     def stop(self):
         self._running = False
         if self._thread:
             self._thread.join(timeout=3)
 
-    # no-ops kept for API compatibility — no longer needed
+    # kept for API compatibility
     def pause(self): pass
     def resume(self): pass
 
@@ -141,22 +156,19 @@ class WakeWordDetector:
                     for _, score in oww.predict(audio.flatten()).items():
                         if score > 0.5:
                             _alert()
-                            self._listen_for_command(stream)
-                            time.sleep(0.5)
+                            cmd = self._listen_for_command(stream)
+                            if cmd.strip():
+                                self.callback(cmd)
+                                # Follow-up mode
+                                self._followup_loop(stream)
+                            time.sleep(0.3)
             return True
         except Exception as e:
             logger.debug(f"openwakeword error: {e}")
             return False
 
     def _run_single_stream(self):
-        """
-        Single stream loop:
-          1. Continuously read mic audio
-          2. On speech burst: transcribe and check for wake word
-          3. On wake word: immediately listen for command on SAME stream
-          4. Pass command text to callback
-        """
-        logger.info("Wake word: single-stream STT fallback")
+        logger.info("Wake word: single-stream STT (follow-up mode enabled)")
 
         if not self.stt or not self.stt.loaded:
             logger.warning("STT not loaded")
@@ -175,7 +187,7 @@ class WakeWordDetector:
                 blocksize=CHUNK, device=device,
             )
             stream.start()
-            logger.info(f"Wake word: single mic stream open (device={device})")
+            logger.info(f"Wake word: mic open (device={device})")
         except Exception as e:
             logger.error(f"Cannot open microphone: {e}")
             return
@@ -198,19 +210,21 @@ class WakeWordDetector:
                     wake_buf.append(data.copy())
                     silent += CHUNK / RATE
                     if silent >= 1.2:
-                        # Transcribe and check
                         audio = np.concatenate(wake_buf, axis=0)
                         text  = _transcribe(self.stt._model, audio).strip()
                         if text:
                             logger.debug(f"Wake check: '{text}'")
                         if text and _is_wake_word(text):
                             _alert()
-                            # Listen for command on the SAME open stream
                             cmd = self._listen_for_command(stream)
                             if cmd.strip():
                                 logger.info(f"Voice command: '{cmd}'")
                                 self.callback(cmd)
-                            time.sleep(0.5)
+                                # ── FOLLOW-UP MODE ─────────────────────────
+                                # After OPAC processes the command, listen for
+                                # more commands without needing wake word again
+                                self._followup_loop(stream)
+                            time.sleep(0.3)
                         wake_buf, collecting, silent = [], False, 0.0
         finally:
             try:
@@ -219,10 +233,66 @@ class WakeWordDetector:
             except Exception:
                 pass
 
-    def _listen_for_command(self, stream) -> str:
+    def _followup_loop(self, stream):
         """
-        Listen for a command using the already-open stream.
-        Shows live partial transcriptions so user sees what is heard.
+        Stay in listening mode after a command.
+        Any speech within FOLLOWUP_TIMEOUT seconds is treated as
+        the next command — no wake word needed.
+        After FOLLOWUP_TIMEOUT seconds of silence, returns to wake word mode.
+        """
+        print("\n  [OPAC] (Say your next command, or stay quiet to return to wake word mode)",
+              flush=True)
+
+        deadline    = time.time() + FOLLOWUP_TIMEOUT
+        buf         = []
+        collecting  = False
+        silent      = 0.0
+
+        while self._running and time.time() < deadline:
+            try:
+                data, _ = stream.read(CHUNK)
+                energy  = float(abs(data).mean())
+            except Exception:
+                time.sleep(0.05)
+                continue
+
+            if energy > MIC_ENERGY_THRESHOLD:
+                collecting = True
+                silent     = 0.0
+                deadline   = time.time() + FOLLOWUP_TIMEOUT  # reset timer on speech
+                buf.append(data.copy())
+            elif collecting:
+                buf.append(data.copy())
+                silent += CHUNK / RATE
+                if silent >= 2.0:
+                    # Transcribe and send as command
+                    audio = np.concatenate(buf, axis=0)
+                    cmd   = self._listen_for_command(stream, already_collected=buf)
+                    # _listen_for_command will handle its own collection
+                    # here we just check if we got something already
+                    if not cmd:
+                        # Use what we already collected
+                        cmd = _transcribe(self.stt._model, audio).strip()
+                    if cmd.strip():
+                        print(f"\n  [OPAC] You said: {cmd}", flush=True)
+                        logger.info(f"Follow-up command: '{cmd}'")
+                        self.callback(cmd)
+                        # Reset follow-up window
+                        deadline   = time.time() + FOLLOWUP_TIMEOUT
+                        buf        = []
+                        collecting = False
+                        silent     = 0.0
+                    else:
+                        # Empty transcription — stop follow-up
+                        break
+
+        print(f"\n  [OPAC] (Back to wake word mode — say 'hey opac')\n",
+              flush=True)
+
+    def _listen_for_command(self, stream, already_collected=None) -> str:
+        """
+        Listen for a command on the already-open stream.
+        Shows live partial transcriptions.
         Returns the full transcribed command string.
         """
         if not self.stt or not self.stt._model:
@@ -230,12 +300,22 @@ class WakeWordDetector:
 
         print("  [OPAC] You said: ", end="", flush=True)
 
-        full_buf  = []
-        cmd_buf   = []
+        full_buf   = list(already_collected) if already_collected else []
+        cmd_buf    = []
         collecting = False
         silent     = 0.0
         partials   = []
-        deadline   = time.time() + 10.0   # 10 second max
+        deadline   = time.time() + 10.0
+
+        # If we already have audio, transcribe it first
+        if already_collected:
+            audio   = np.concatenate(already_collected, axis=0)
+            partial = _transcribe(self.stt._model, audio).strip()
+            if partial:
+                partials.append(partial)
+                print(partial + " ", end="", flush=True)
+            # Then listen for more
+            deadline = time.time() + 5.0
 
         while time.time() < deadline:
             try:
@@ -254,9 +334,8 @@ class WakeWordDetector:
                 full_buf.append(data.copy())
                 silent += CHUNK / RATE
 
-                # Every 0.6 s of silence — show partial
                 if silent >= 0.6:
-                    burst = np.concatenate(cmd_buf, axis=0)
+                    burst   = np.concatenate(cmd_buf, axis=0)
                     partial = _transcribe(self.stt._model, burst).strip()
                     if partial:
                         partials.append(partial)
@@ -265,16 +344,14 @@ class WakeWordDetector:
                     collecting = False
                     silent     = 0.0
 
-                # 2.5 s of silence — done
                 if silent >= 2.5:
                     break
 
-        print()  # newline after live output
+        print(flush=True)
 
         if not full_buf:
             return ""
 
-        # Final transcription on complete audio (more accurate)
         full_audio = np.concatenate(full_buf, axis=0)
         final      = _transcribe(self.stt._model, full_audio).strip()
 
@@ -282,7 +359,6 @@ class WakeWordDetector:
             live = " ".join(partials)
             if final.lower().strip() != live.lower().strip():
                 print(f"  [OPAC] (heard) {final}", flush=True)
-            else:
-                logger.info(f"Command: '{final}'")
+            logger.info(f"Command: '{final}'")
 
         return final
