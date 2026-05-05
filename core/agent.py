@@ -641,11 +641,47 @@ class OPACAgent:
 # ── helpers ────────────────────────────────────────────────────────────────────
 
 def _extract_topic(query: str) -> str:
-    clean = query.strip().rstrip("?").strip()
+    """
+    Extract the core search topic from a natural language query.
+    Handles voice transcription noise like "God bless." at the end.
+
+    Examples:
+      "can you tell me about Nepal? God bless." -> "Nepal"
+      "what is machine learning"                -> "machine learning"
+      "tell me about chess"                     -> "chess"
+      "Nepal"                                   -> "Nepal"
+    """
+    clean = query.strip()
+
+    # Remove trailing voice noise — phrases that appear after the real question
+    # These are common Whisper hallucinations at end of utterances
+    noise_endings = re.compile(
+        r"[\.\?!]*\s*(?:god bless|amen|thank you|thanks|please|"
+        r"okay|ok|alright|sure|yes|no|bye|goodbye|"
+        r"you know|i mean|right|yeah|yep|hmm+|uh+|um+|"
+        r"that'?s? (?:it|all|good|great|fine)|"
+        r"if you (?:can|could|will|would)|"
+        r"i (?:think|guess|hope|believe))[\.\?!]*\s*$",
+        re.I
+    )
+    clean = noise_endings.sub("", clean).strip()
+
+    # Strip question marks and trailing punctuation
+    clean = clean.rstrip("?.!").strip()
+
+    # Strip question preambles
     clean = _TOPIC_STRIP.sub("", clean).strip()
+
+    # Strip "about X", "on X", "regarding X"
     m = re.match(r"^(?:about|on|regarding)\s+(.+)$", clean, re.I)
     if m:
         clean = m.group(1).strip()
+
+    noise_split = re.compile(
+        r"\s+(?:god|please|thank|okay|alright|amen).*$", re.I
+    )
+    clean = noise_split.sub("", clean).strip()
+
     return clean if clean else query
 
 
