@@ -26,7 +26,7 @@ logger = get_logger("opac.voice.wakeword")
 WAKE_TRIGGERS = [
     "hey opac", "hey opec", "hey o-back", "hey o back", "hey oh back",
     "hey oh-back", "hey opak", "hi opac", "hi opec", "hello opac",
-    "hello opec", "opac", "opec", "cook", "let's cook", "hello",
+    "hello opec", "opac", "opec", "hello", "let's cook", "cook",
 ]
 
 FUZZY_THRESHOLD      = 0.72   # full-phrase similarity
@@ -37,7 +37,7 @@ CHUNK = 1024
 
 # How long to stay in follow-up mode after a command (seconds)
 # During this time, anything you say is treated as a command without wake word
-FOLLOWUP_TIMEOUT = 8.0
+FOLLOWUP_TIMEOUT = 10800.0  # 3 hours
 
 
 def _is_wake_word(text: str) -> bool:
@@ -235,10 +235,9 @@ class WakeWordDetector:
 
     def _followup_loop(self, stream):
         """
-        Stay in listening mode after a command.
-        Any speech within FOLLOWUP_TIMEOUT seconds is treated as
-        the next command — no wake word needed.
-        After FOLLOWUP_TIMEOUT seconds of silence, returns to wake word mode.
+        Stay in listening mode after a command for up to 3 hours.
+        Any speech is treated as the next command — no wake word needed.
+        Only returns to wake word mode after 3 hours of complete silence.
         """
         print("\n  [OPAC] (Say your next command, or stay quiet to return to wake word mode)",
               flush=True)
