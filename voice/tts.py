@@ -1,47 +1,49 @@
 """
 OPAC Text-to-Speech  (Phase 3)
 ================================
-Fixes:
-  1. Uses Windows SAPI directly via win32com — no pyttsx3 runAndWait() bug
-  2. Supports sentence-level streaming (speak as writing happens)
-  3. Supports interrupt (stop mid-speech instantly)
-  4. Falls back to pyttsx3, then espeak if win32com not available
+Sets tts_state.speaking flag while audio plays so the wake word
+detector can ignore microphone input during that window — preventing
+OPAC from hearing its own voice and responding to itself.
 
-Windows SAPI flags:
-  SVSFDefault         = 0
-  SVSFlagsAsync       = 1   (non-blocking)
-  SVSFPurgeBeforeSpeak= 2   (interrupt + clear queue)
+Backends tried in order:
+  1. Windows SAPI via win32com  (pip install pywin32)
+  2. pyttsx3 fallback           (pip install pyttsx3)
+  3. espeak-ng                  (Linux)
 """
 
 from __future__ import annotations
 
 import platform
+import queue
 import re
 import threading
-import queue
 from utils.logger import get_logger
 from config.settings import TTS_ENGINE, PIPER_VOICE_MODEL
 
 logger = get_logger("opac.voice.tts")
-
 IS_WINDOWS = platform.system() == "Windows"
+
+# Import shared speaking flag
+try:
+    from voice.tts_state import speaking as _speaking_flag
+except ImportError:
+    import threading as _t
+    _speaking_flag = _t.Event()
 
 
 class TTSEngine:
     def __init__(self):
-        self._backend  = None
-        self._loaded   = False
-        self._sapi     = None       # win32com SAPI object
-        self._pyttsx   = None       # pyttsx3 engine (fallback)
+        self._backend   = None
+        self._loaded    = False
+        self._sapi      = None
+        self._pyttsx    = None
         self._tts_queue = queue.Queue()
-        self._worker   = None
-        self._speaking = threading.Event()
+        self._worker    = None
         self._stop_flag = threading.Event()
 
     def load(self) -> None:
         if self._loaded:
             return
-
         if TTS_ENGINE.lower() not in ("none", "off"):
             if PIPER_VOICE_MODEL and self._try_piper():
                 pass
@@ -54,10 +56,7 @@ class TTSEngine:
             else:
                 logger.warning("No TTS backend available")
                 self._backend = "none"
-
         self._loaded = True
-
-        # Start background TTS worker thread
         self._worker = threading.Thread(target=self._tts_worker, daemon=True)
         self._worker.start()
 
@@ -70,7 +69,7 @@ class TTSEngine:
         return self._backend or "none"
 
     def speak(self, text: str) -> None:
-        """Queue text for speech. Returns immediately — speaks in background."""
+        """Queue text for speech. Non-blocking."""
         if not self._loaded or not text.strip() or self._backend == "none":
             return
         clean = _clean_for_speech(text)
@@ -78,25 +77,21 @@ class TTSEngine:
             self._tts_queue.put(clean)
 
     def speak_streaming(self, sentence: str) -> None:
-        """Queue a sentence for immediate streaming speech."""
+        """Queue a sentence for immediate streaming TTS."""
         self.speak(sentence)
 
     def interrupt(self) -> None:
-        """Stop current speech and clear queue immediately."""
-        # Clear the queue
+        """Stop current speech and clear queue (called by human input)."""
+        # Clear queue
         while not self._tts_queue.empty():
             try:
                 self._tts_queue.get_nowait()
             except queue.Empty:
                 break
-
-        # Stop current speech
         self._stop_flag.set()
-
         if self._backend == "sapi_direct" and self._sapi:
             try:
-                # SVSFPurgeBeforeSpeak = 2 — stops and clears
-                self._sapi.Speak("", 2)
+                self._sapi.Speak("", 2)  # SVSFPurgeBeforeSpeak
             except Exception:
                 pass
         elif self._backend == "pyttsx3" and self._pyttsx:
@@ -104,36 +99,36 @@ class TTSEngine:
                 self._pyttsx.stop()
             except Exception:
                 pass
-
         self._stop_flag.clear()
+        _speaking_flag.clear()  # immediately mark as not speaking
 
-    # ── worker thread ──────────────────────────────────────────────────────────
+    # ── worker ────────────────────────────────────────────────────────────────
 
     def _tts_worker(self):
-        """Background thread — processes TTS queue continuously."""
         while True:
             try:
                 text = self._tts_queue.get(timeout=0.5)
             except queue.Empty:
                 continue
-
-            if text is None:  # shutdown signal
+            if text is None:
                 break
-
-            self._speaking.set()
+            # Set flag BEFORE speaking so mic is muted during playback
+            _speaking_flag.set()
             try:
-                self._speak_now(text)
+                if not self._stop_flag.is_set():
+                    self._speak_now(text)
             except Exception as e:
-                logger.error(f"TTS worker error: {e}")
+                logger.error(f"TTS error: {e}")
             finally:
-                self._speaking.clear()
+                # Small cooldown after speech ends so mic doesn't catch
+                # the tail end of audio reverb from speakers
+                if self._tts_queue.empty():
+                    import time
+                    time.sleep(0.4)
+                    _speaking_flag.clear()
                 self._tts_queue.task_done()
 
     def _speak_now(self, text: str) -> None:
-        """Actually speak — called from worker thread."""
-        if self._stop_flag.is_set():
-            return
-
         if self._backend == "sapi_direct":
             self._speak_sapi_direct(text)
         elif self._backend == "pyttsx3":
@@ -143,37 +138,31 @@ class TTSEngine:
         elif self._backend == "espeak":
             self._speak_espeak(text)
 
-    # ── backend loaders ────────────────────────────────────────────────────────
+    # ── backends ──────────────────────────────────────────────────────────────
 
     def _try_sapi_direct(self) -> bool:
-        """Windows SAPI via win32com — most reliable, no runAndWait() bug."""
         try:
             import win32com.client
             sapi = win32com.client.Dispatch("SAPI.SpVoice")
-            # Test it works
-            sapi.Rate  = 1    # slightly faster than default
+            sapi.Rate   = 1
             sapi.Volume = 90
-
-            # Try to find a good voice
             voices = sapi.GetVoices()
             for i in range(voices.Count):
-                v = voices.Item(i)
+                v    = voices.Item(i)
                 name = v.GetDescription().lower()
-                if "zira" in name or "david" in name or "mark" in name:
+                if any(n in name for n in ("zira", "david", "mark", "hazel")):
                     sapi.Voice = v
                     break
-
             self._sapi    = sapi
             self._backend = "sapi_direct"
             self._loaded  = True
-            logger.info("TTS: Windows SAPI (win32com) ready — supports interrupt")
+            logger.info("TTS: Windows SAPI (win32com) ready")
             return True
         except Exception as e:
             logger.debug(f"SAPI direct failed: {e}")
             return False
 
     def _try_pyttsx3(self) -> bool:
-        """pyttsx3 fallback — has runAndWait bug but better than nothing."""
         try:
             import pyttsx3
             engine = pyttsx3.init()
@@ -181,13 +170,13 @@ class TTSEngine:
             engine.setProperty("volume", 0.9)
             voices = engine.getProperty("voices")
             for v in voices:
-                if "zira" in v.name.lower() or "david" in v.name.lower():
+                if any(n in v.name.lower() for n in ("zira", "david")):
                     engine.setProperty("voice", v.id)
                     break
             self._pyttsx  = engine
             self._backend = "pyttsx3"
             self._loaded  = True
-            logger.info("TTS: pyttsx3 ready (interrupt support limited)")
+            logger.info("TTS: pyttsx3 ready")
             return True
         except Exception as e:
             logger.debug(f"pyttsx3 failed: {e}")
@@ -199,7 +188,7 @@ class TTSEngine:
             self._piper_voice = PiperVoice.load(PIPER_VOICE_MODEL)
             self._backend     = "piper"
             self._loaded      = True
-            logger.info(f"TTS: Piper ready ({PIPER_VOICE_MODEL})")
+            logger.info(f"TTS: Piper ready")
             return True
         except Exception as e:
             logger.debug(f"Piper failed: {e}")
@@ -218,17 +207,15 @@ class TTSEngine:
             logger.debug(f"espeak failed: {e}")
         return False
 
-    # ── speech methods ─────────────────────────────────────────────────────────
+    # ── speech ────────────────────────────────────────────────────────────────
 
     def _speak_sapi_direct(self, text: str) -> None:
         try:
-            # SVSFlagsAsync = 1 — non-blocking so we can check stop_flag
-            self._sapi.Speak(text, 1)
-            # Wait for speech to finish, checking stop_flag
             import time
-            while self._sapi.Status.RunningState == 2:  # 2 = running
+            self._sapi.Speak(text, 1)  # SVSFlagsAsync
+            while self._sapi.Status.RunningState == 2:
                 if self._stop_flag.is_set():
-                    self._sapi.Speak("", 2)  # purge
+                    self._sapi.Speak("", 2)
                     break
                 time.sleep(0.05)
         except Exception as e:
@@ -236,7 +223,6 @@ class TTSEngine:
 
     def _speak_pyttsx3(self, text: str) -> None:
         try:
-            # Reinitialize engine each call to avoid runAndWait() bug
             import pyttsx3
             engine = pyttsx3.init()
             engine.setProperty("rate", 175)
@@ -245,7 +231,7 @@ class TTSEngine:
             engine.runAndWait()
             engine.stop()
         except Exception as e:
-            logger.error(f"pyttsx3 speak error: {e}")
+            logger.error(f"pyttsx3 error: {e}")
 
     def _speak_piper(self, text: str) -> None:
         try:
@@ -262,7 +248,7 @@ class TTSEngine:
             audio = np.frombuffer(frames, dtype=np.int16).astype(np.float32) / 32768.0
             sd.play(audio, samplerate=rate, blocking=True)
         except Exception as e:
-            logger.error(f"Piper speak error: {e}")
+            logger.error(f"Piper error: {e}")
 
     def _speak_espeak(self, text: str) -> None:
         try:
@@ -274,7 +260,6 @@ class TTSEngine:
 
 
 def _clean_for_speech(text: str) -> str:
-    """Remove markdown and symbols that sound bad when spoken."""
     text = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL)
     text = re.sub(r"\*\*(.+?)\*\*", r"\1", text)
     text = re.sub(r"\*(.+?)\*",     r"\1", text)

@@ -20,6 +20,14 @@ import numpy as np
 from utils.logger import get_logger
 from config.settings import MIC_ENERGY_THRESHOLD
 
+# Import shared TTS speaking flag — when set, ignore mic input
+# so OPAC cannot hear its own speaker output and respond to itself
+try:
+    from voice.tts_state import speaking as _tts_speaking
+except ImportError:
+    import threading as _t
+    _tts_speaking = _t.Event()
+
 logger = get_logger("opac.voice.wakeword")
 
 # What Whisper transcribes "hey opac" as — only real variants, no false positives
@@ -203,6 +211,12 @@ class WakeWordDetector:
                     time.sleep(0.05)
                     continue
 
+                # Ignore mic while OPAC is speaking — prevents self-interruption
+                if _tts_speaking.is_set():
+                    wake_buf, collecting, silent = [], False, 0.0
+                    time.sleep(0.05)
+                    continue
+
                 if energy > MIC_ENERGY_THRESHOLD:
                     collecting, silent = True, 0.0
                     wake_buf.append(data.copy())
@@ -252,6 +266,12 @@ class WakeWordDetector:
                 data, _ = stream.read(CHUNK)
                 energy  = float(abs(data).mean())
             except Exception:
+                time.sleep(0.05)
+                continue
+
+            # Ignore mic while TTS is playing
+            if _tts_speaking.is_set():
+                buf, collecting, silent = [], False, 0.0
                 time.sleep(0.05)
                 continue
 
