@@ -182,6 +182,10 @@ class OPACAgent:
                 callback=self._on_voice_command,
                 stt_engine=self._stt,
             )
+            # Give wakeword detector a reference to TTS so it can
+            # call interrupt() directly when human speaks during playback
+            if self._tts:
+                self._wakeword.set_tts_engine(self._tts)
             self._wakeword.start()
             print(f"  [OPAC] Wake word active -- say '{WAKE_WORD}' to activate\n")
         except Exception as e:

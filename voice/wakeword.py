@@ -1,14 +1,15 @@
 """
 OPAC Wake Word Detection  (Phase 3)
 =====================================
-Single-stream architecture — one mic stream for everything.
+Self-interruption fix:
+  - While TTS is speaking, mic is monitored but NOT transcribed
+  - If human speaks LOUDLY (energy > INTERRUPT_THRESHOLD), TTS is
+    interrupted immediately, then we listen for the command
+  - OPAC's own speaker output is quieter than a human speaking
+    directly into the mic, so the threshold separates them
 
-Key behaviours:
-  - Fuzzy matching catches Whisper mishearing "hey opac"
-  - After a command is processed, OPAC enters FOLLOW-UP mode:
-    listens for the next command for up to 8 seconds without
-    needing the wake word again. Only returns to wake word
-    detection after 8 seconds of silence.
+Human interrupts OPAC:  speak loudly -> energy spike -> interrupt + listen
+OPAC's own voice:       lower energy via mic -> ignored
 """
 
 from __future__ import annotations
@@ -20,55 +21,49 @@ import numpy as np
 from utils.logger import get_logger
 from config.settings import MIC_ENERGY_THRESHOLD
 
-# Import shared TTS speaking flag — when set, ignore mic input
-# so OPAC cannot hear its own speaker output and respond to itself
+logger = get_logger("opac.voice.wakeword")
+
+# Import shared TTS speaking flag
 try:
     from voice.tts_state import speaking as _tts_speaking
 except ImportError:
     import threading as _t
     _tts_speaking = _t.Event()
 
-logger = get_logger("opac.voice.wakeword")
-
-# What Whisper transcribes "hey opac" as — only real variants, no false positives
 WAKE_TRIGGERS = [
     "hey opac", "hey opec", "hey o-back", "hey o back", "hey oh back",
     "hey oh-back", "hey opak", "hi opac", "hi opec", "hello opac",
     "hello opec", "opac", "opec", "hello", "cook", "let's cook",
 ]
-
-FUZZY_THRESHOLD      = 0.72   # full-phrase similarity
-WORD_FUZZY_THRESHOLD = 0.80   # single-word similarity (stricter)
+FUZZY_THRESHOLD      = 0.72
+WORD_FUZZY_THRESHOLD = 0.80
 
 RATE  = 16000
 CHUNK = 1024
 
-# How long to stay in follow-up mode after a command (seconds)
-# During this time, anything you say is treated as a command without wake word
+# Energy threshold to interrupt TTS — set higher than normal so OPAC's
+# own speaker output (which reaches the mic at lower volume) doesn't trigger.
+# Human voice directly into mic is typically 800-3000+ energy units.
+# Speaker bleed-through is typically 100-400.
+# Set to 600 — adjust down if your mic is far from speakers.
+INTERRUPT_THRESHOLD = 600
+
 FOLLOWUP_TIMEOUT = 10800.0  # 3 hours
 
 
 def _is_wake_word(text: str) -> bool:
     t = text.lower().strip().rstrip(".!")
-
-    # Must be short — real commands come AFTER the wake word, not during it
     if len(t.split()) > 5:
         return False
-
-    # Exact substring
     for trigger in WAKE_TRIGGERS:
         if trigger in t:
             logger.info(f"Wake word exact: '{trigger}' in '{t}'")
             return True
-
-    # Fuzzy full-phrase
     for trigger in WAKE_TRIGGERS:
         ratio = difflib.SequenceMatcher(None, t, trigger).ratio()
         if ratio >= FUZZY_THRESHOLD:
             logger.info(f"Wake word fuzzy: '{t}' ~ '{trigger}' ({ratio:.2f})")
             return True
-
-    # Word-level — only for very short utterances (1-3 words)
     if len(t.split()) <= 3:
         for word in t.split():
             word = word.strip(".,!?'")
@@ -76,7 +71,6 @@ def _is_wake_word(text: str) -> bool:
                 if difflib.SequenceMatcher(None, word, variant).ratio() >= WORD_FUZZY_THRESHOLD:
                     logger.info(f"Wake word word: '{word}' ~ '{variant}'")
                     return True
-
     return False
 
 
@@ -98,7 +92,6 @@ def _get_input_device():
 
 
 def _alert():
-    """Beep + visual indicator."""
     print("\n" + "-" * 50, flush=True)
     print("  [OPAC] Listening ...", flush=True)
     print("-" * 50, flush=True)
@@ -122,23 +115,28 @@ def _transcribe(model, audio: np.ndarray) -> str:
 
 class WakeWordDetector:
     def __init__(self, callback, stt_engine=None):
-        self.callback = callback
-        self.stt      = stt_engine
-        self._running = False
-        self._thread  = None
+        self.callback  = callback
+        self.stt       = stt_engine
+        self._running  = False
+        self._thread   = None
+        # Reference to TTS engine for interrupt calls
+        self._tts_engine = None
+
+    def set_tts_engine(self, tts):
+        """Give the detector a reference to TTS so it can interrupt it."""
+        self._tts_engine = tts
 
     def start(self):
         self._running = True
         self._thread  = threading.Thread(target=self._run, daemon=True)
         self._thread.start()
-        logger.info("Wake word detector started (follow-up mode enabled)")
+        logger.info("Wake word detector started")
 
     def stop(self):
         self._running = False
         if self._thread:
             self._thread.join(timeout=3)
 
-    # kept for API compatibility
     def pause(self): pass
     def resume(self): pass
 
@@ -161,13 +159,20 @@ class WakeWordDetector:
                                 blocksize=1280, device=device) as stream:
                 while self._running:
                     audio, _ = stream.read(1280)
+                    energy   = float(abs(audio).mean())
+
+                    # While TTS is speaking, only interrupt on loud human voice
+                    if _tts_speaking.is_set():
+                        if energy > INTERRUPT_THRESHOLD:
+                            self._interrupt_and_listen(stream)
+                        continue
+
                     for _, score in oww.predict(audio.flatten()).items():
                         if score > 0.5:
                             _alert()
                             cmd = self._listen_for_command(stream)
                             if cmd.strip():
                                 self.callback(cmd)
-                                # Follow-up mode
                                 self._followup_loop(stream)
                             time.sleep(0.3)
             return True
@@ -176,7 +181,7 @@ class WakeWordDetector:
             return False
 
     def _run_single_stream(self):
-        logger.info("Wake word: single-stream STT (follow-up mode enabled)")
+        logger.info("Wake word: single-stream STT")
 
         if not self.stt or not self.stt.loaded:
             logger.warning("STT not loaded")
@@ -211,12 +216,21 @@ class WakeWordDetector:
                     time.sleep(0.05)
                     continue
 
-                # Ignore mic while OPAC is speaking — prevents self-interruption
+                # ── While TTS is speaking ──────────────────────────────────
+                # Don't transcribe (would hear OPAC's own voice)
+                # BUT do allow human to interrupt with a loud voice
                 if _tts_speaking.is_set():
-                    wake_buf, collecting, silent = [], False, 0.0
-                    time.sleep(0.05)
+                    if energy > INTERRUPT_THRESHOLD:
+                        logger.info(
+                            f"Human interruption detected (energy={energy:.0f})"
+                        )
+                        self._interrupt_and_listen(stream)
+                    else:
+                        # Clear buffer so stale audio doesn't affect next wake check
+                        wake_buf, collecting, silent = [], False, 0.0
                     continue
 
+                # ── Normal wake word detection ─────────────────────────────
                 if energy > MIC_ENERGY_THRESHOLD:
                     collecting, silent = True, 0.0
                     wake_buf.append(data.copy())
@@ -234,9 +248,6 @@ class WakeWordDetector:
                             if cmd.strip():
                                 logger.info(f"Voice command: '{cmd}'")
                                 self.callback(cmd)
-                                # ── FOLLOW-UP MODE ─────────────────────────
-                                # After OPAC processes the command, listen for
-                                # more commands without needing wake word again
                                 self._followup_loop(stream)
                             time.sleep(0.3)
                         wake_buf, collecting, silent = [], False, 0.0
@@ -247,19 +258,37 @@ class WakeWordDetector:
             except Exception:
                 pass
 
-    def _followup_loop(self, stream):
+    def _interrupt_and_listen(self, stream):
         """
-        Stay in listening mode after a command for up to 3 hours.
-        Any speech is treated as the next command — no wake word needed.
-        Only returns to wake word mode after 3 hours of complete silence.
+        Human spoke while OPAC was talking.
+        Interrupt TTS immediately, then listen for the command.
         """
-        print("\n  [OPAC] (Say your next command, or stay quiet to return to wake word mode)",
-              flush=True)
+        # Stop TTS
+        if self._tts_engine:
+            self._tts_engine.interrupt()
+        elif _tts_speaking.is_set():
+            _tts_speaking.clear()
 
-        deadline    = time.time() + FOLLOWUP_TIMEOUT
-        buf         = []
-        collecting  = False
-        silent      = 0.0
+        print("\n  [OPAC] (interrupted)", flush=True)
+        _alert()
+
+        # Brief pause so speaker echo dies down
+        time.sleep(0.3)
+
+        cmd = self._listen_for_command(stream)
+        if cmd.strip():
+            logger.info(f"Interrupt command: '{cmd}'")
+            self.callback(cmd)
+            self._followup_loop(stream)
+
+    def _followup_loop(self, stream):
+        """Stay in listening mode for FOLLOWUP_TIMEOUT seconds."""
+        print("\n  [OPAC] (listening for next command)\n", flush=True)
+
+        deadline   = time.time() + FOLLOWUP_TIMEOUT
+        buf        = []
+        collecting = False
+        silent     = 0.0
 
         while self._running and time.time() < deadline:
             try:
@@ -269,51 +298,36 @@ class WakeWordDetector:
                 time.sleep(0.05)
                 continue
 
-            # Ignore mic while TTS is playing
+            # While TTS speaking, watch for interrupt only
             if _tts_speaking.is_set():
+                if energy > INTERRUPT_THRESHOLD:
+                    self._interrupt_and_listen(stream)
+                    deadline = time.time() + FOLLOWUP_TIMEOUT
                 buf, collecting, silent = [], False, 0.0
-                time.sleep(0.05)
                 continue
 
             if energy > MIC_ENERGY_THRESHOLD:
                 collecting = True
                 silent     = 0.0
-                deadline   = time.time() + FOLLOWUP_TIMEOUT  # reset timer on speech
+                deadline   = time.time() + FOLLOWUP_TIMEOUT
                 buf.append(data.copy())
             elif collecting:
                 buf.append(data.copy())
                 silent += CHUNK / RATE
                 if silent >= 2.0:
-                    # Transcribe and send as command
                     audio = np.concatenate(buf, axis=0)
-                    cmd   = self._listen_for_command(stream, already_collected=buf)
-                    # _listen_for_command will handle its own collection
-                    # here we just check if we got something already
-                    if not cmd:
-                        # Use what we already collected
-                        cmd = _transcribe(self.stt._model, audio).strip()
+                    cmd   = _transcribe(self.stt._model, audio).strip()
                     if cmd.strip():
                         print(f"\n  [OPAC] You said: {cmd}", flush=True)
                         logger.info(f"Follow-up command: '{cmd}'")
                         self.callback(cmd)
-                        # Reset follow-up window
-                        deadline   = time.time() + FOLLOWUP_TIMEOUT
-                        buf        = []
-                        collecting = False
-                        silent     = 0.0
-                    else:
-                        # Empty transcription — stop follow-up
-                        break
+                        deadline = time.time() + FOLLOWUP_TIMEOUT
+                    buf, collecting, silent = [], False, 0.0
 
-        print(f"\n  [OPAC] (Back to wake word mode — say 'hey opac')\n",
-              flush=True)
+        print(f"\n  [OPAC] (back to wake word mode)\n", flush=True)
 
     def _listen_for_command(self, stream, already_collected=None) -> str:
-        """
-        Listen for a command on the already-open stream.
-        Shows live partial transcriptions.
-        Returns the full transcribed command string.
-        """
+        """Listen for a command on the open stream with live display."""
         if not self.stt or not self.stt._model:
             return ""
 
@@ -326,14 +340,12 @@ class WakeWordDetector:
         partials   = []
         deadline   = time.time() + 10.0
 
-        # If we already have audio, transcribe it first
         if already_collected:
             audio   = np.concatenate(already_collected, axis=0)
             partial = _transcribe(self.stt._model, audio).strip()
             if partial:
                 partials.append(partial)
                 print(partial + " ", end="", flush=True)
-            # Then listen for more
             deadline = time.time() + 5.0
 
         while time.time() < deadline:

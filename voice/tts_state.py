@@ -1,9 +1,9 @@
 """
-Shared flag: True while OPAC's TTS is actively playing audio.
-The wake word detector checks this and ignores mic input during playback
-so OPAC cannot interrupt itself with its own speaker output.
+Shared TTS state.
+- speaking: set while OPAC TTS is playing audio
+- interrupt_requested: set when human wants to interrupt
 """
 import threading
 
-# Set by TTSEngine when speaking starts, cleared when speaking ends
-speaking = threading.Event()
+speaking           = threading.Event()  # True while TTS plays
+interrupt_requested = threading.Event() # True when human interrupts
