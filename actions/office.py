@@ -683,51 +683,167 @@ class VSCodeSession:
 # BROWSER SESSION
 # ======================================================================
 class BrowserSession:
+    """
+    Two-mode browser control:
+      - open_normal()  : launches browser via subprocess (normal window, user profile, extensions)
+      - open_playwright() : launches Playwright-controlled instance for OPAC automation
+      - connect_cdp()  : connects to an already-running browser via remote debug port (best of both)
+
+    Incognito fix: Playwright by default strips the user profile.
+    We fix this by passing --user-data-dir to point to the real Chrome profile folder.
+
+    www.chrome / www.brave fix: never navigate to chrome:// or brave:// URLs.
+    Use https:// equivalents instead.
+    """
+
     EXE_PATHS = {
-        "chrome": [r"C:\Program Files\Google\Chrome\Application\chrome.exe",
-                   r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe"],
-        "edge":   [r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe"],
-        "brave":  [r"C:\Program Files\BraveSoftware\Brave-Browser\Application\brave.exe",
-                   r"C:\Program Files (x86)\BraveSoftware\Brave-Browser\Application\brave.exe"],
+        "chrome": [
+            r"C:\Program Files\Google\Chrome\Application\chrome.exe",
+            r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe",
+        ],
+        "edge": [
+            r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe",
+            r"C:\Program Files\Microsoft\Edge\Application\msedge.exe",
+        ],
+        "brave": [
+            r"C:\Program Files\BraveSoftware\Brave-Browser\Application\brave.exe",
+            r"C:\Program Files (x86)\BraveSoftware\Brave-Browser\Application\brave.exe",
+        ],
     }
-    NEW_TAB = {"chrome": "chrome://newtab", "edge": "edge://newtab",
-               "brave": "https://search.brave.com/"}
+
+    USER_DATA_DIRS = {
+        "chrome": Path.home() / "AppData/Local/Google/Chrome/User Data",
+        "edge":   Path.home() / "AppData/Local/Microsoft/Edge/User Data",
+        "brave":  Path.home() / "AppData/Local/BraveSoftware/Brave-Browser/User Data",
+    }
+
+    # Safe HTTPS new-tab equivalents (never use chrome:// / brave:// — Playwright blocks them)
+    HOME_URLS = {
+        "chrome": "https://www.google.com",
+        "edge":   "https://www.bing.com",
+        "brave":  "https://search.brave.com",
+    }
 
     def __init__(self):
         self._browser = self._context = self._page = self._pw = None
-        self._name = ""
+        self._name    = ""
+        self._normal_proc = None   # subprocess handle when opened normally
 
     @property
     def active(self): return self._page is not None
 
+    # ── Open normally (subprocess) ─────────────────────────────────────────────
+
+    def open_normal(self, name: str = "chrome", profile: str = "") -> Tuple[bool, str]:
+        """
+        Open browser exactly like a user double-clicking it.
+        Uses subprocess — preserves extensions, theme, default profile.
+        No Playwright — no incognito look, no www.chrome issue.
+        """
+        name = name.lower().strip()
+        exe  = next((p for p in self.EXE_PATHS.get(name, []) if Path(p).exists()), None)
+        if not exe:
+            import shutil
+            exe = shutil.which(name) or shutil.which(name + ".exe")
+        if not exe:
+            return False, f"Cannot find {name}. Make sure it is installed."
+
+        args = [exe]
+        if profile:
+            pdir = self._resolve_profile_dir(name, profile)
+            if pdir:
+                udir = self.USER_DATA_DIRS.get(name, "")
+                if udir:
+                    args.append(f"--user-data-dir={udir}")
+                args.append(f"--profile-directory={pdir}")
+
+        try:
+            flags = subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP if IS_WINDOWS else 0
+            self._normal_proc = subprocess.Popen(args, creationflags=flags)
+            self._name = name
+            profile_msg = f" (profile: {profile})" if profile else ""
+            return True, f"Opened {name.title()}{profile_msg}"
+        except Exception as e:
+            return False, f"Cannot open {name}: {e}"
+
+    # ── Open with Playwright (for OPAC automation) ─────────────────────────────
+
     def open(self, name: str = "chrome", profile: str = "") -> Tuple[bool, str]:
+        """
+        Open browser with Playwright for full OPAC control.
+        Passes --user-data-dir so Chrome uses real profile (no incognito look).
+        Navigates to safe HTTPS home URL (never chrome:// which causes www.chrome).
+        """
         try:
             from playwright.sync_api import sync_playwright
         except ImportError:
             raise ImportError("pip install playwright && playwright install chromium")
+
         name = name.lower().strip()
-        exe  = next((p for p in self.EXE_PATHS.get(name,[]) if Path(p).exists()), None)
+        exe  = next((p for p in self.EXE_PATHS.get(name, []) if Path(p).exists()), None)
+
+        # Build args to use the real user profile (fixes incognito look)
         args = []
+        udir = self.USER_DATA_DIRS.get(name)
+        if udir and udir.exists():
+            args.append(f"--user-data-dir={udir}")
+
         if profile:
-            pdir = self._find_profile(name, profile)
-            if pdir: args.append(f"--profile-directory={pdir}")
+            pdir = self._resolve_profile_dir(name, profile)
+            if pdir:
+                args.append(f"--profile-directory={pdir}")
+
+        # Disable some Playwright automation flags that make browser look different
+        args += [
+            "--disable-blink-features=AutomationControlled",
+            "--no-first-run",
+            "--no-default-browser-check",
+        ]
+
         try:
-            self._pw      = sync_playwright().start()
-            kw            = dict(headless=False, args=args)
-            if exe:       kw["executable_path"] = exe
+            self._pw = sync_playwright().start()
+            kw = dict(headless=False, args=args)
+            if exe: kw["executable_path"] = exe
             self._browser = self._pw.chromium.launch(**kw)
             self._context = self._browser.new_context()
             self._page    = self._context.new_page()
             self._name    = name
-            default = self.NEW_TAB.get(name, "https://www.google.com")
+
+            # Navigate to safe HTTPS home (never chrome:// — causes www.chrome bug)
+            home = self.HOME_URLS.get(name, "https://www.google.com")
             try:
-                if default.startswith("http"): self._page.goto(default, timeout=10000)
-                else:
-                    try: self._page.goto(default, timeout=5000)
-                    except: self._page.goto("https://www.google.com", timeout=8000)
-            except Exception: pass
-            return True, f"Opened {name.title()}"
-        except Exception as e: return False, f"Cannot open {name}: {e}"
+                self._page.goto(home, timeout=10000)
+            except Exception:
+                pass
+
+            profile_msg = f" (profile: {profile})" if profile else ""
+            return True, f"Opened {name.title()}{profile_msg} (OPAC controlled)"
+        except Exception as e:
+            return False, f"Cannot open {name}: {e}"
+
+    # ── Connect to already-running browser via CDP ─────────────────────────────
+
+    def connect_cdp(self, port: int = 9222) -> Tuple[bool, str]:
+        """
+        Connect to a browser already running with --remote-debugging-port=9222.
+        Best approach: user starts browser normally, OPAC connects and controls it.
+        Start Chrome with: chrome.exe --remote-debugging-port=9222
+        """
+        try:
+            from playwright.sync_api import sync_playwright
+        except ImportError:
+            raise ImportError("pip install playwright && playwright install chromium")
+        try:
+            self._pw      = sync_playwright().start()
+            browser       = self._pw.chromium.connect_over_cdp(f"http://localhost:{port}")
+            self._browser = browser
+            self._context = browser.contexts[0]
+            self._page    = self._context.pages[0] if self._context.pages else self._context.new_page()
+            return True, f"Connected to browser on port {port}"
+        except Exception as e:
+            return False, f"Cannot connect (is browser running with --remote-debugging-port={port}?): {e}"
+
+    # ── Navigation commands ────────────────────────────────────────────────────
 
     def navigate(self, url: str) -> Tuple[bool, str]:
         if not url.startswith("http"): url = "https://" + url
@@ -739,16 +855,18 @@ class BrowserSession:
         return True, f"Searched Google: {q}"
 
     def search_youtube(self, q: str) -> Tuple[bool, str]:
-        self._page.goto(f"https://www.youtube.com/results?search_query={q.replace(' ','+')}",timeout=15000)
+        self._page.goto(f"https://www.youtube.com/results?search_query={q.replace(' ','+')}",
+                        timeout=15000)
         return True, f"Searched YouTube: {q}"
 
     def new_tab(self, url: str = "") -> Tuple[bool, str]:
         self._page = self._context.new_page()
-        default = self.NEW_TAB.get(self._name, "https://www.google.com")
-        target  = url if (url and url != "about:blank") else default
+        home = self.HOME_URLS.get(self._name, "https://www.google.com")
+        target = url if (url and url.startswith("http")) else home
         try:
-            if target.startswith("http"): self._page.goto(target, timeout=8000)
-        except Exception: pass
+            self._page.goto(target, timeout=8000)
+        except Exception:
+            pass
         return True, "New tab opened"
 
     def get_page_text(self) -> str:
@@ -756,91 +874,336 @@ class BrowserSession:
             return self._page.evaluate("""() => {
                 ['script','style','nav','footer','header','aside']
                     .forEach(t=>document.querySelectorAll(t).forEach(e=>e.remove()));
-                return document.body.innerText||'';
+                return document.body.innerText || '';
             }""")[:3000]
-        except Exception: return ""
+        except Exception:
+            return ""
+
+    # ── WhatsApp Web ───────────────────────────────────────────────────────────
 
     def whatsapp_send(self, contact: str, message: str) -> Tuple[bool, str]:
-        self._page.goto("https://web.whatsapp.com", timeout=25000)
+        """
+        Send WhatsApp message via WhatsApp Web.
+        Uses multiple selector strategies for robustness.
+        """
         try:
-            self._page.wait_for_selector('[data-testid="chat-list"]', timeout=30000)
-            s = self._page.query_selector('[data-testid="search"]')
-            if s:
-                s.click(); s.type(contact, delay=50); time.sleep(1.5)
-                r = self._page.query_selector('[data-testid="cell-frame-container"]')
-                if r:
-                    r.click(); time.sleep(1)
-                    b = self._page.query_selector('[data-testid="conversation-compose-box-input"]')
-                    if b:
-                        b.click(); b.type(message, delay=30); b.press("Enter")
-                        return True, f"WhatsApp message sent to {contact}"
-            return False, "Contact not found"
-        except Exception as e: return False, f"WhatsApp error: {e}"
+            self._page.goto("https://web.whatsapp.com", timeout=30000)
+        except Exception as e:
+            return False, f"Cannot open WhatsApp Web: {e}"
+
+        # Wait for WhatsApp to fully load (accepts multiple possible selectors)
+        loaded = False
+        for selector in ['[data-testid="chat-list"]', '#pane-side', 'div[aria-label="Chat list"]']:
+            try:
+                self._page.wait_for_selector(selector, timeout=35000)
+                loaded = True
+                break
+            except Exception:
+                continue
+
+        if not loaded:
+            return False, "WhatsApp Web did not load. Scan the QR code first if needed."
+
+        time.sleep(1)
+
+        # Find the search box (multiple selectors for different WA Web versions)
+        search_box = None
+        for sel in ['[data-testid="search"]',
+                    'div[contenteditable="true"][data-tab="3"]',
+                    'div[aria-label="Search input textbox"]',
+                    'div[title="Search input textbox"]']:
+            search_box = self._page.query_selector(sel)
+            if search_box:
+                break
+
+        if not search_box:
+            return False, "Cannot find WhatsApp search box"
+
+        try:
+            search_box.click()
+            time.sleep(0.5)
+            search_box.fill(contact)
+            time.sleep(2)
+
+            # Click first result
+            result = None
+            for sel in ['[data-testid="cell-frame-container"]',
+                        'div[aria-label*="' + contact[:10] + '"]',
+                        'span[title="' + contact + '"]']:
+                result = self._page.query_selector(sel)
+                if result:
+                    break
+
+            if not result:
+                return False, f"Contact '{contact}' not found in WhatsApp"
+
+            result.click()
+            time.sleep(1.5)
+
+            # Find message box
+            msg_box = None
+            for sel in ['[data-testid="conversation-compose-box-input"]',
+                        'div[contenteditable="true"][data-tab="10"]',
+                        'div[aria-label="Type a message"]',
+                        'footer div[contenteditable="true"]']:
+                msg_box = self._page.query_selector(sel)
+                if msg_box:
+                    break
+
+            if not msg_box:
+                return False, "Cannot find WhatsApp message box"
+
+            msg_box.click()
+            time.sleep(0.3)
+            msg_box.fill(message)
+            time.sleep(0.3)
+            msg_box.press("Enter")
+            return True, f"WhatsApp message sent to {contact}"
+
+        except Exception as e:
+            return False, f"WhatsApp error: {e}"
+
+    # ── Close ─────────────────────────────────────────────────────────────────
 
     def close(self) -> str:
         try:
             if self._browser: self._browser.close()
             if self._pw:      self._pw.stop()
-        except Exception: pass
+        except Exception:
+            pass
         self._browser = self._context = self._page = self._pw = None
         return "Browser closed"
 
-    def _find_profile(self, browser: str, name: str) -> Optional[str]:
-        udirs = {
-            "chrome": Path.home()/"AppData/Local/Google/Chrome/User Data",
-            "edge":   Path.home()/"AppData/Local/Microsoft/Edge/User Data",
-            "brave":  Path.home()/"AppData/Local/BraveSoftware/Brave-Browser/User Data",
-        }
-        udir = udirs.get(browser)
-        if not udir or not udir.exists(): return None
-        nl = name.lower()
-        if nl in ("default","1","first","main"): return "Default"
+    # ── Profile resolution ────────────────────────────────────────────────────
+
+    def _resolve_profile_dir(self, browser: str, name: str) -> Optional[str]:
+        """Resolve spoken profile name to Chrome profile directory name."""
+        udir = self.USER_DATA_DIRS.get(browser)
+        if not udir or not udir.exists():
+            return None
+        nl = name.lower().strip()
+        if nl in ("default", "1", "first", "main", "personal"):
+            return "Default"
         m = re.search(r"\d+", name)
         if m:
-            n = int(m.group()); return "Default" if n==1 else f"Profile {n-1}"
+            n = int(m.group())
+            return "Default" if n == 1 else f"Profile {n - 1}"
+        # Search by profile display name in Preferences file
         try:
             import json
             for d in udir.iterdir():
-                if d.is_dir() and (d.name=="Default" or d.name.startswith("Profile")):
-                    prefs = d/"Preferences"
+                if not d.is_dir():
+                    continue
+                if d.name == "Default" or d.name.startswith("Profile"):
+                    prefs = d / "Preferences"
                     if prefs.exists():
-                        pn = json.loads(prefs.read_text(errors="ignore")).get("profile",{}).get("name","").lower()
-                        if nl in pn: return d.name
-        except Exception: pass
+                        try:
+                            data  = json.loads(prefs.read_text(errors="ignore"))
+                            pname = data.get("profile", {}).get("name", "").lower()
+                            if nl in pname or pname in nl:
+                                return d.name
+                        except Exception:
+                            pass
+        except Exception:
+            pass
         return None
 
+    # Keep backward compat
+    def _find_profile(self, browser: str, name: str) -> Optional[str]:
+        return self._resolve_profile_dir(browser, name)
 
-# ======================================================================
-# MESSAGING
-# ======================================================================
+
 class MessagingEngine:
+    """
+    Send messages via:
+    - WhatsApp Web (via BrowserSession — most reliable)
+    - Viber / Telegram / Discord desktop (via pyautogui)
+    """
+
     def send_desktop(self, app: str, contact: str, message: str) -> Tuple[bool, str]:
+        """Send via desktop app using pyautogui."""
         try:
-            import pyautogui, pyperclip
+            import pyautogui
+            try:
+                import pyperclip
+                has_clipboard = True
+            except ImportError:
+                has_clipboard = False
         except ImportError:
             raise ImportError("pip install pyautogui pyperclip")
-        TITLES = {"viber":["Viber"],"telegram":["Telegram"],"discord":["Discord"],"skype":["Skype"]}
-        titles = TITLES.get(app.lower(), [app.title()])
+
+        app_lower = app.lower()
+
+        WINDOW_TITLES = {
+            "viber":    ["Viber"],
+            "telegram": ["Telegram"],
+            "discord":  ["Discord"],
+            "skype":    ["Skype"],
+            "signal":   ["Signal"],
+        }
+        titles = WINDOW_TITLES.get(app_lower, [app.title()])
+
         if IS_WINDOWS:
             import ctypes
-            u32 = ctypes.windll.user32; hwnd = None
+            u32  = ctypes.windll.user32
+            hwnd = None
             for t in titles:
                 hwnd = u32.FindWindowW(None, t)
-                if hwnd: u32.ShowWindow(hwnd,9); u32.SetForegroundWindow(hwnd); time.sleep(0.8); break
-            if not hwnd: return False, f"{app} window not found."
-        pyautogui.hotkey("ctrl","f"); time.sleep(0.8)
-        pyautogui.typewrite(contact, interval=0.05); time.sleep(1.2)
-        pyautogui.press("enter"); time.sleep(1.0)
-        w,h = pyautogui.size(); pyautogui.click(w//2, int(h*0.92)); time.sleep(0.5)
-        try: pyperclip.copy(message); pyautogui.hotkey("ctrl","v")
-        except: pyautogui.typewrite(message, interval=0.04)
-        time.sleep(0.3); pyautogui.press("enter")
+                if hwnd:
+                    # Restore if minimized, bring to front
+                    u32.ShowWindow(hwnd, 9)    # SW_RESTORE
+                    u32.SetForegroundWindow(hwnd)
+                    time.sleep(1.0)
+                    break
+
+            if not hwnd:
+                return False, (
+                    f"{app} window not found. "
+                    f"Make sure {app} is open and not minimized to tray."
+                )
+
+        time.sleep(0.5)
+        pyautogui.FAILSAFE = False
+
+        # Viber: Ctrl+F opens search. Telegram: Ctrl+K or Ctrl+F
+        if app_lower == "viber":
+            pyautogui.hotkey("ctrl", "f")
+        elif app_lower == "telegram":
+            pyautogui.hotkey("ctrl", "k")
+        else:
+            pyautogui.hotkey("ctrl", "f")
+
+        time.sleep(1.0)
+        pyautogui.hotkey("ctrl", "a")
+        time.sleep(0.2)
+
+        if has_clipboard:
+            pyperclip.copy(contact)
+            pyautogui.hotkey("ctrl", "v")
+        else:
+            pyautogui.typewrite(contact, interval=0.07)
+
+        time.sleep(1.5)
+        pyautogui.press("enter")
+        time.sleep(1.2)
+
+        # Click the message input area
+        w, h = pyautogui.size()
+        pyautogui.click(w // 2, int(h * 0.90))
+        time.sleep(0.8)
+
+        if has_clipboard:
+            pyperclip.copy(message)
+            pyautogui.hotkey("ctrl", "v")
+        else:
+            pyautogui.typewrite(message, interval=0.05)
+
+        time.sleep(0.5)
+        pyautogui.press("enter")
         return True, f"Message sent to {contact} via {app}"
 
 
 # ======================================================================
-# OFFICE MANAGER
+# SIMPLE TEXT EDITOR SESSION (Notepad, CMD, PowerShell)
 # ======================================================================
+class SimpleEditorSession:
+    """
+    Voice control for Notepad, CMD, and PowerShell.
+    - Notepad: create file, write content, open in Notepad
+    - CMD: run commands and show output
+    - PowerShell: run scripts and show output
+    """
+
+    def __init__(self, app: str = "notepad"):
+        self._app      = app.lower()
+        self._path: Optional[Path] = None
+        self._content  = ""
+
+    @property
+    def active(self): return True  # always active once started
+
+    def new(self) -> str:
+        if self._app == "notepad":
+            import tempfile
+            tf = tempfile.NamedTemporaryFile(suffix=".txt", delete=False, mode="w")
+            self._path    = Path(tf.name)
+            self._content = ""
+            tf.close()
+            _open_file(self._path)
+            return "Notepad is open. Say: write X, append X, save as NAME in downloads."
+        elif self._app == "cmd":
+            subprocess.Popen("cmd.exe", creationflags=subprocess.CREATE_NEW_CONSOLE if IS_WINDOWS else 0)
+            return "CMD opened. Say: run command X."
+        elif self._app in ("powershell", "ps"):
+            subprocess.Popen("powershell.exe",
+                             creationflags=subprocess.CREATE_NEW_CONSOLE if IS_WINDOWS else 0)
+            return "PowerShell opened. Say: run command X."
+        return f"Unknown app: {self._app}"
+
+    def write(self, text: str) -> str:
+        """Write (overwrite) content to Notepad file."""
+        if self._app != "notepad":
+            return "Write only supported for Notepad."
+        self._content = text
+        self._sync()
+        return f"Written ({len(text.split())} words)"
+
+    def append(self, text: str) -> str:
+        """Append content to Notepad file."""
+        if self._app != "notepad":
+            return "Append only supported for Notepad."
+        self._content = (self._content + "\n\n" + text).strip()
+        self._sync()
+        return f"Appended ({len(text.split())} words)"
+
+    def run_command(self, cmd: str) -> str:
+        """Run a command in CMD or PowerShell and return output."""
+        if self._app == "cmd":
+            runner = ["cmd", "/c", cmd]
+        elif self._app in ("powershell", "ps"):
+            runner = ["powershell", "-NoProfile", "-Command", cmd]
+        else:
+            return f"Cannot run commands in {self._app}"
+        try:
+            result = subprocess.run(runner, capture_output=True, text=True, timeout=30)
+            out = (result.stdout + result.stderr).strip()[:500]
+            return f"Output: {out}" if out else "Command completed (no output)"
+        except subprocess.TimeoutExpired:
+            return "Command timed out after 30 seconds"
+        except Exception as e:
+            return f"Error: {e}"
+
+    def save(self, name: str, folder: str) -> Tuple[bool, str]:
+        """Save Notepad content to a named file."""
+        if self._app != "notepad":
+            return False, f"Save not applicable for {self._app}"
+        path = _resolve_path(name, folder, ".txt")
+        try:
+            path.write_text(self._content, encoding="utf-8")
+            self._path = path
+            _open_file(path)
+            return True, f"Saved: {path.name} in {path.parent.name}"
+        except Exception as e:
+            return False, f"Save failed: {e}"
+
+    def close(self) -> str:
+        self._content = ""
+        return f"{self._app.title()} session closed."
+
+    def summary(self) -> str:
+        if self._app == "notepad" and self._content:
+            return f"Notepad: {len(self._content.split())} words"
+        return f"{self._app.title()}: active"
+
+    def _sync(self):
+        """Write current content to the temp file (Notepad auto-detects change)."""
+        if self._path:
+            try:
+                self._path.write_text(self._content, encoding="utf-8")
+            except Exception:
+                pass
+
+
 class OfficeManager:
     def __init__(self):
         self.word:    Optional[WordSession]       = None
@@ -848,6 +1211,7 @@ class OfficeManager:
         self.excel:   Optional[ExcelSession]      = None
         self.browser: Optional[BrowserSession]    = None
         self.vscode:  Optional[VSCodeSession]     = None
+        self.editor:  Optional[SimpleEditorSession] = None
         self.msg      = MessagingEngine()
 
     def start_word(self, path: str = "") -> str:
@@ -940,12 +1304,46 @@ class OfficeManager:
         if cmd == "status":  return vs.summary()
         return f"Unknown: {cmd}"
 
-    def start_browser(self, name: str = "chrome", profile: str = "") -> Tuple[bool,str]:
-        if self.browser and self.browser.active:
-            try: self.browser.close()
-            except Exception: pass
-        self.browser = BrowserSession()
-        return self.browser.open(name, profile)
+    def start_editor(self, app: str = "notepad") -> str:
+        """Start Notepad, CMD, or PowerShell session."""
+        self.editor = SimpleEditorSession(app)
+        return self.editor.new()
+
+    def editor_cmd(self, cmd: str, content: str, extra: dict = None) -> str:
+        """Route a command to the simple editor session."""
+        if not self.editor: return "No editor open. Say 'open notepad' first."
+        extra = extra or {}
+        if cmd == "write":   return self.editor.write(content)
+        if cmd == "append":  return self.editor.append(content)
+        if cmd == "run":     return self.editor.run_command(content)
+        if cmd == "save":
+            ok, msg = self.editor.save(extra.get("name","notes"), extra.get("folder","downloads"))
+            if ok: self.editor = None
+            return msg
+        if cmd == "close":
+            msg = self.editor.close(); self.editor = None; return msg
+        if cmd == "status":  return self.editor.summary()
+        return f"Unknown editor command: {cmd}"
+
+    def start_browser(self, name: str = "chrome", profile: str = "",
+                      for_automation: bool = True) -> Tuple[bool,str]:
+        """
+        Open browser.
+        for_automation=True  → Playwright controlled (OPAC can search/navigate)
+        for_automation=False → subprocess (normal window, extensions, profile)
+        """
+        if for_automation:
+            if self.browser and self.browser.active:
+                try: self.browser.close()
+                except Exception: pass
+            self.browser = BrowserSession()
+            return self.browser.open(name, profile)
+        else:
+            # Just open normally — no Playwright
+            b = BrowserSession()
+            ok, msg = b.open_normal(name, profile)
+            # Don't assign to self.browser — no automation session
+            return ok, msg
 
     def browser_cmd(self, cmd: str, content: str = "") -> Tuple[bool, str]:
         if not self.browser or not self.browser.active:
@@ -975,11 +1373,12 @@ class OfficeManager:
         if self.pptx:                            parts.append(self.pptx.summary())
         if self.excel:                           parts.append(self.excel.summary())
         if self.vscode:                          parts.append(self.vscode.summary())
-        if self.browser and self.browser.active: parts.append("Browser: open")
+        if self.browser and self.browser.active: parts.append("Browser: open (OPAC controlled)")
+        if self.editor:                          parts.append(self.editor.summary())
         return "\n  ".join(parts) if parts else "No active sessions."
 
     def close_all(self):
-        for s in [self.word, self.pptx, self.excel, self.vscode]:
+        for s in [self.word, self.pptx, self.excel, self.vscode, self.editor]:
             if s:
                 try: s.close()
                 except Exception: pass
