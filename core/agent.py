@@ -49,6 +49,11 @@ _INTENT_VSCODE_NEW = re.compile(
     r"^create\s+(?:a\s+)?(?:new\s+)?(python|javascript|typescript|html|css|java|"
     r"c\+\+|cpp|c#|csharp|go|rust|ruby|php|sql|bash|powershell|markdown|json|yaml|text)\s+"
     r"file\s+(?:called|named)?\s*(.+)$", re.I)
+_INTENT_NOTEPAD = re.compile(r"^open\s+notepad.*$", re.I)
+_INTENT_CMD     = re.compile(r"^open\s+(?:cmd|command prompt|terminal).*$", re.I)
+_INTENT_PS      = re.compile(r"^open\s+(?:powershell|ps).*$", re.I)
+_EDITOR_CMDS    = re.compile(
+    r"^(?:write|append|add|type|run (?:command|this)|save as|close (?:notepad|cmd|powershell))", re.I)
 _VSCODE_CMDS    = re.compile(
     r"^(?:write (?:a )?(?:function|class|method|code|script)|"
     r"create (?:a )?(?:function|class)|add (?:a )?(?:function|class|import)|"
@@ -490,17 +495,25 @@ class OPACAgent:
             browser_name = m.group(1).lower()
             rest         = m.group(2).strip()
             profile      = ""
-            # Check for profile spec: "with work profile", "with profile 2"
-            pm = re.search(r"with\s+(.+?)\s+profile|profile\s+(\w+)", rest, re.I)
+
+            # Extract profile spec: "with work profile", "with profile 2"
+            pm = re.search(r"with\s+(.+?)\s+profile|with\s+profile\s+(\w+)", rest, re.I)
             if pm:
                 profile = (pm.group(1) or pm.group(2) or "").strip()
-                rest    = re.sub(r"with\s+.+?\s+profile|profile\s+\w+", "", rest).strip()
+                rest    = re.sub(r"with\s+.+?\s+profile|with\s+profile\s+\w+", "", rest, flags=re.I).strip()
+
+            # Detect if automation is needed (search, navigate, etc.)
+            needs_automation = bool(re.search(
+                r"\b(search|go to|navigate|open new tab|whatsapp|youtube)\b", rest, re.I))
+
             self.start()
-            ok, msg = self._get_office().start_browser(browser_name, profile)
+            ok, msg = self._get_office().start_browser(
+                browser_name, profile, for_automation=needs_automation)
             print(f"\n  OPAC: {msg}\n"); self._tts_speak(msg)
+
             # Handle "and search for X" in same command
             sm = re.search(r"(?:and\s+)?search\s+(?:for\s+)?(.+)$", rest, re.I)
-            if sm and ok:
+            if sm and ok and needs_automation:
                 self._handle_browser_continuation(f"search for {sm.group(1)}")
             return
 
@@ -523,6 +536,27 @@ class OPACAgent:
         # ── Phase 4 — browser tab ─────────────────────────────────────────────
         if _INTENT_TAB.match(txt) or _INTENT_TAB2.match(txt):
             self.start(); self._summarize_current_tab(); return
+
+        # ── Phase 5.5 — Notepad / CMD / PowerShell ───────────────────────────
+        if _INTENT_NOTEPAD.match(txt):
+            self.start()
+            msg = self._get_office().start_editor("notepad")
+            print(f"\n  OPAC: {msg}\n"); self._tts_speak(msg); return
+
+        if _INTENT_CMD.match(txt):
+            self.start()
+            msg = self._get_office().start_editor("cmd")
+            print(f"\n  OPAC: {msg}\n"); self._tts_speak(msg); return
+
+        if _INTENT_PS.match(txt):
+            self.start()
+            msg = self._get_office().start_editor("powershell")
+            print(f"\n  OPAC: {msg}\n"); self._tts_speak(msg); return
+
+        # Editor session continuation
+        office = self._get_office()
+        if office.editor and _EDITOR_CMDS.match(txt):
+            self._handle_editor_continuation(txt); return
 
         # ── Phase 5 — list apps ───────────────────────────────────────────────
         if _INTENT_APPS.match(txt):
@@ -772,6 +806,42 @@ class OPACAgent:
             print(f"\n  OPAC: {msg}\n"); self._tts_speak(msg)
         else:
             print("\n  OPAC: Could not generate code.\n")
+
+    def _handle_editor_continuation(self, txt: str):
+        """Route commands to active Notepad/CMD/PowerShell session."""
+        office = self._get_office()
+        tl     = txt.lower().strip()
+
+        if re.match(r"close (?:notepad|cmd|powershell|ps)", tl):
+            msg = office.editor_cmd("close", "")
+            print(f"\n  OPAC: {msg}\n"); self._tts_speak(msg); return
+
+        if "save as" in tl or tl.startswith("save"):
+            from actions.office import parse_save
+            name, folder = parse_save(txt)
+            msg = office.editor_cmd("save", "", {"name": name, "folder": folder})
+            print(f"\n  OPAC: {msg}\n"); self._tts_speak(msg); return
+
+        if re.match(r"run (?:command|this|it)?", tl):
+            cmd_text = re.sub(r"(?i)^run\s+(?:command\s+)?", "", txt).strip()
+            msg = office.editor_cmd("run", cmd_text)
+            print(f"\n  OPAC: {msg}\n"); self._tts_speak(msg); return
+
+        if re.match(r"append|add to", tl):
+            content = re.sub(r"(?i)^(?:append|add to)\s+", "", txt).strip()
+            # Generate via NPU if it's a topic not literal text
+            if len(content.split()) < 4:
+                content = self._generate_text(f"Write a paragraph about: {content}")
+            msg = office.editor_cmd("append", content)
+            print(f"\n  OPAC: {msg}\n"); self._tts_speak(msg); return
+
+        # Default: write/type content
+        content = re.sub(r"(?i)^(?:write|type|add|say)\s+", "", txt).strip()
+        if len(content.split()) < 4:
+            print(f"\n  [OPAC] Generating content ...", flush=True)
+            content = self._generate_text(f"Write a short paragraph about: {content}")
+        msg = office.editor_cmd("write", content)
+        print(f"\n  OPAC: {msg}\n"); self._tts_speak(msg)
 
     def _handle_browser_continuation(self, txt: str):
         """Route a command to the active browser session."""
