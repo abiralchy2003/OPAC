@@ -44,6 +44,16 @@ _INTENT_WORD    = re.compile(r"^(?:open word|create (?:new )?(?:word )?document|
 _INTENT_PPTX    = re.compile(r"^(?:open (?:power\s*point|ppt|presentation)|create (?:new )?(?:power\s*point|presentation)).*$", re.I)
 _INTENT_EXCEL   = re.compile(r"^(?:open excel|create (?:new )?(?:excel|spreadsheet|workbook)).*$", re.I)
 _INTENT_BROWSER = re.compile(r"^open\s+(chrome|edge|brave|firefox)\s*(.*)$", re.I)
+_INTENT_VSCODE  = re.compile(r"^(?:open\s+)?(?:vs\s*code|vscode|cursor|sublime)\s*(.*)$", re.I)
+_INTENT_VSCODE_NEW = re.compile(
+    r"^create\s+(?:a\s+)?(?:new\s+)?(python|javascript|typescript|html|css|java|"
+    r"c\+\+|cpp|c#|csharp|go|rust|ruby|php|sql|bash|powershell|markdown|json|yaml|text)\s+"
+    r"file\s+(?:called|named)?\s*(.+)$", re.I)
+_VSCODE_CMDS    = re.compile(
+    r"^(?:write (?:a )?(?:function|class|method|code|script)|"
+    r"create (?:a )?(?:function|class)|add (?:a )?(?:function|class|import)|"
+    r"run (?:the )?file|run it|save (?:the )?file|close (?:vs\s*code|vscode)|"
+    r"vs\s*code status)", re.I)
 _INTENT_MSG     = re.compile(
     r"^(?:open\s+)?(?:message|send|text)\s+(?:via\s+)?(\w+)\s+(?:to\s+)?(.+?)\s+(.+)$", re.I)
 _INTENT_WHATSAPP = re.compile(
@@ -430,6 +440,32 @@ class OPACAgent:
         if office.browser and office.browser.active and _BROWSER_CMDS.match(txt):
             self._handle_browser_continuation(txt); return
 
+        # Active VS Code session
+        if office.vscode and _VSCODE_CMDS.match(txt):
+            self._handle_vscode_continuation(txt); return
+
+        # ── Phase 5.5 — VS Code new session ───────────────────────────────────
+        m = _INTENT_VSCODE_NEW.match(txt)
+        if m:
+            language = m.group(1).lower()
+            name     = m.group(2).strip()
+            self.start()
+            msg = self._get_office().vscode_cmd("create", "", {
+                "language": language, "name": name, "folder": "documents"
+            })
+            print(f"\n  OPAC: {msg}\n"); self._tts_speak(msg); return
+
+        m = _INTENT_VSCODE.match(txt)
+        if m:
+            rest = (m.group(1) or "").strip()
+            self.start()
+            editor = "cursor" if "cursor" in txt.lower() else "sublime" if "sublime" in txt.lower() else "vscode"
+            if rest and _looks_like_path(rest):
+                msg = self._get_office().start_vscode(editor=editor, path=rest)
+            else:
+                msg = self._get_office().start_vscode(editor=editor)
+            print(f"\n  OPAC: {msg}\n"); self._tts_speak(msg); return
+
         # ── Phase 5.5 — New office sessions ───────────────────────────────────
         if _INTENT_WORD.match(txt):
             self.start()
@@ -692,6 +728,50 @@ class OPACAgent:
             content = re.sub(r"(?i)^add\s+row\s+(?:with\s+)?", "", txt).strip()
             msg = office.excel_cmd("row", content)
             print(f"\n  OPAC: {msg}\n"); self._tts_speak(msg); return
+
+    def _handle_vscode_continuation(self, txt: str):
+        """Route a command to the active VS Code session."""
+        office = self._get_office()
+        tl     = txt.lower().strip()
+
+        if re.match(r"close (?:vs\s*code|vscode)", tl):
+            msg = office.vscode_cmd("close", "")
+            print(f"\n  OPAC: {msg}\n"); self._tts_speak(msg); return
+
+        if re.match(r"run (?:the )?file|run it", tl):
+            msg = office.vscode_cmd("run", "")
+            print(f"\n  OPAC: {msg}\n"); self._tts_speak(msg); return
+
+        # Write function / class / code
+        topic = re.sub(
+            r"(?i)^(?:write|add|create)\s+(?:a\s+)?(?:function|class|method|code|script|import)\s*(?:that|which|to|called|named|for)?\s*",
+            "", txt
+        ).strip()
+        if not topic:
+            topic = txt
+
+        # Detect what kind of code to generate
+        lang = getattr(office.vscode, '_language', 'python') if office.vscode else 'python'
+        if re.search(r"\bfunction\b", txt, re.I):
+            prompt = f"Write a {lang} function that: {topic}. Only output the code, no explanation."
+        elif re.search(r"\bclass\b", txt, re.I):
+            prompt = f"Write a {lang} class for: {topic}. Only output the code, no explanation."
+        elif re.search(r"\bimport\b", txt, re.I):
+            prompt = f"Write the import statements needed for: {topic} in {lang}. Only output the code."
+        else:
+            prompt = f"Write {lang} code that: {topic}. Only output the code, no explanation."
+
+        print(f"\n  [OPAC] Generating {lang} code ...", flush=True)
+        code = self._generate_text(prompt)
+
+        if code:
+            # Strip markdown code fences if present
+            import re as _re
+            code = _re.sub(r"```[\w]*\n?", "", code).strip("`").strip()
+            msg  = office.vscode_cmd("append", code)
+            print(f"\n  OPAC: {msg}\n"); self._tts_speak(msg)
+        else:
+            print("\n  OPAC: Could not generate code.\n")
 
     def _handle_browser_continuation(self, txt: str):
         """Route a command to the active browser session."""
