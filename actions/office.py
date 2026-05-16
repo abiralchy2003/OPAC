@@ -770,56 +770,78 @@ class BrowserSession:
 
     def open(self, name: str = "chrome", profile: str = "") -> Tuple[bool, str]:
         """
-        Open browser with Playwright for full OPAC control.
-        Passes --user-data-dir so Chrome uses real profile (no incognito look).
-        Navigates to safe HTTPS home URL (never chrome:// which causes www.chrome).
+        Launch browser via subprocess with --remote-debugging-port=9222,
+        then connect via Chrome DevTools Protocol (CDP).
+
+        Benefits:
+        - Browser opens completely normally (real profile, extensions, theme)
+        - No Playwright launch = no --user-data-dir error, no asyncio conflict
+        - OPAC connects for full automation after browser starts
+        - Works with Chrome, Edge, Brave identically
         """
-        try:
-            from playwright.sync_api import sync_playwright
-        except ImportError:
-            raise ImportError("pip install playwright && playwright install chromium")
-
         name = name.lower().strip()
+        self._name = name
         exe  = next((p for p in self.EXE_PATHS.get(name, []) if Path(p).exists()), None)
+        if not exe:
+            import shutil
+            exe = shutil.which(name) or shutil.which(name + ".exe")
+        if not exe:
+            return False, f"{name} not found. Is it installed?"
 
-        # Build args to use the real user profile (fixes incognito look)
-        args = []
-        udir = self.USER_DATA_DIRS.get(name)
-        if udir and udir.exists():
-            args.append(f"--user-data-dir={udir}")
+        # Build subprocess args
+        debug_port = 9222
+        launch_args = [exe, f"--remote-debugging-port={debug_port}", "--no-first-run"]
 
         if profile:
             pdir = self._resolve_profile_dir(name, profile)
-            if pdir:
-                args.append(f"--profile-directory={pdir}")
+            udir = self.USER_DATA_DIRS.get(name)
+            if pdir and udir and udir.exists():
+                launch_args += [f"--user-data-dir={udir}",
+                                f"--profile-directory={pdir}"]
 
-        # Disable some Playwright automation flags that make browser look different
-        args += [
-            "--disable-blink-features=AutomationControlled",
-            "--no-first-run",
-            "--no-default-browser-check",
-        ]
+        # Launch browser normally with debug port
+        try:
+            flags = subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP if IS_WINDOWS else 0
+            subprocess.Popen(launch_args, creationflags=flags)
+        except Exception as e:
+            return False, f"Cannot launch {name}: {e}"
+
+        # Wait for browser to start accepting CDP connections
+        import socket
+        for _ in range(20):   # up to 10 seconds
+            time.sleep(0.5)
+            try:
+                with socket.create_connection(("localhost", debug_port), timeout=0.5):
+                    break
+            except OSError:
+                continue
+
+        # Connect via CDP
+        try:
+            from playwright.sync_api import sync_playwright
+        except ImportError:
+            # Browser opened but OPAC can't control it — still useful
+            return True, f"Opened {name.title()} (install playwright for OPAC control)"
 
         try:
-            self._pw = sync_playwright().start()
-            kw = dict(headless=False, args=args)
-            if exe: kw["executable_path"] = exe
-            self._browser = self._pw.chromium.launch(**kw)
-            self._context = self._browser.new_context()
-            self._page    = self._context.new_page()
-            self._name    = name
-
-            # Navigate to safe HTTPS home (never chrome:// — causes www.chrome bug)
-            home = self.HOME_URLS.get(name, "https://www.google.com")
-            try:
-                self._page.goto(home, timeout=10000)
-            except Exception:
-                pass
+            self._pw      = sync_playwright().start()
+            self._browser = self._pw.chromium.connect_over_cdp(
+                f"http://localhost:{debug_port}")
+            contexts = self._browser.contexts
+            if contexts:
+                self._context = contexts[0]
+                pages = self._context.pages
+                self._page = pages[0] if pages else self._context.new_page()
+            else:
+                self._context = self._browser.new_context()
+                self._page    = self._context.new_page()
 
             profile_msg = f" (profile: {profile})" if profile else ""
-            return True, f"Opened {name.title()}{profile_msg} (OPAC controlled)"
+            return True, f"Opened {name.title()}{profile_msg} — OPAC connected"
         except Exception as e:
-            return False, f"Cannot open {name}: {e}"
+            # Browser opened fine even if OPAC connection failed
+            logger.warning(f"CDP connect failed: {e}")
+            return True, f"Opened {name.title()} (OPAC control unavailable: {e})"
 
     # ── Connect to already-running browser via CDP ─────────────────────────────
 
@@ -1015,91 +1037,133 @@ class BrowserSession:
 
 class MessagingEngine:
     """
-    Send messages via:
-    - WhatsApp Web (via BrowserSession — most reliable)
-    - Viber / Telegram / Discord desktop (via pyautogui)
+    Send messages via Viber, WhatsApp desktop, Telegram, Discord.
+    Uses EnumWindows for robust window finding (handles partial titles).
+    Waits up to 15 seconds for app to load after opening.
     """
 
+    @staticmethod
+    def _find_window(app_name: str, timeout: float = 15.0) -> int:
+        """
+        Find a window containing app_name in its title.
+        Waits up to timeout seconds for it to appear.
+        Returns HWND or 0 if not found.
+        """
+        if not IS_WINDOWS:
+            return 0
+        import ctypes
+
+        found = [0]
+        app_lower = app_name.lower()
+
+        WNDENUMPROC = ctypes.WINFUNCTYPE(ctypes.c_bool, ctypes.c_int, ctypes.c_int)
+
+        def enum_callback(hwnd, lparam):
+            length = ctypes.windll.user32.GetWindowTextLengthW(hwnd)
+            if length > 0:
+                buf = ctypes.create_unicode_buffer(length + 1)
+                ctypes.windll.user32.GetWindowTextW(hwnd, buf, length + 1)
+                title = buf.value.lower()
+                if app_lower in title and ctypes.windll.user32.IsWindowVisible(hwnd):
+                    found[0] = hwnd
+                    return False   # stop enumeration
+            return True
+
+        deadline = time.time() + timeout
+        while time.time() < deadline and found[0] == 0:
+            ctypes.windll.user32.EnumWindows(WNDENUMPROC(enum_callback), 0)
+            if found[0] == 0:
+                time.sleep(0.5)
+
+        return found[0]
+
     def send_desktop(self, app: str, contact: str, message: str) -> Tuple[bool, str]:
-        """Send via desktop app using pyautogui."""
+        """Send message via desktop app using pyautogui."""
         try:
             import pyautogui
             try:
-                import pyperclip
-                has_clipboard = True
+                import pyperclip; has_clip = True
             except ImportError:
-                has_clipboard = False
+                has_clip = False
         except ImportError:
             raise ImportError("pip install pyautogui pyperclip")
 
-        app_lower = app.lower()
-
-        WINDOW_TITLES = {
-            "viber":    ["Viber"],
-            "telegram": ["Telegram"],
-            "discord":  ["Discord"],
-            "skype":    ["Skype"],
-            "signal":   ["Signal"],
-        }
-        titles = WINDOW_TITLES.get(app_lower, [app.title()])
-
-        if IS_WINDOWS:
-            import ctypes
-            u32  = ctypes.windll.user32
-            hwnd = None
-            for t in titles:
-                hwnd = u32.FindWindowW(None, t)
-                if hwnd:
-                    # Restore if minimized, bring to front
-                    u32.ShowWindow(hwnd, 9)    # SW_RESTORE
-                    u32.SetForegroundWindow(hwnd)
-                    time.sleep(1.0)
-                    break
-
-            if not hwnd:
-                return False, (
-                    f"{app} window not found. "
-                    f"Make sure {app} is open and not minimized to tray."
-                )
-
-        time.sleep(0.5)
         pyautogui.FAILSAFE = False
 
-        # Viber: Ctrl+F opens search. Telegram: Ctrl+K or Ctrl+F
+        print(f"  [OPAC] Looking for {app} window ...", flush=True)
+        hwnd = self._find_window(app, timeout=15.0)
+
+        if not hwnd:
+            return False, (
+                f"{app} window not found after 15 seconds. "
+                f"Make sure {app} is open and visible (not minimized to system tray)."
+            )
+
+        # Focus the window
+        import ctypes
+        u32 = ctypes.windll.user32
+        u32.ShowWindow(hwnd, 9)         # SW_RESTORE
+        u32.SetForegroundWindow(hwnd)
+        time.sleep(1.0)
+
+        app_lower = app.lower()
+
+        # Open new chat / search
         if app_lower == "viber":
-            pyautogui.hotkey("ctrl", "f")
+            # Viber: Ctrl+N opens new message dialog
+            pyautogui.hotkey("ctrl", "n")
+            time.sleep(1.5)
         elif app_lower == "telegram":
             pyautogui.hotkey("ctrl", "k")
+            time.sleep(1.0)
+        elif app_lower in ("whatsapp",):
+            pyautogui.hotkey("ctrl", "f")
+            time.sleep(1.0)
         else:
             pyautogui.hotkey("ctrl", "f")
+            time.sleep(1.0)
 
-        time.sleep(1.0)
+        # Type contact name
         pyautogui.hotkey("ctrl", "a")
         time.sleep(0.2)
-
-        if has_clipboard:
+        if has_clip:
             pyperclip.copy(contact)
             pyautogui.hotkey("ctrl", "v")
         else:
-            pyautogui.typewrite(contact, interval=0.07)
-
+            for ch in contact:
+                pyautogui.press(ch)
+                time.sleep(0.05)
         time.sleep(1.5)
-        pyautogui.press("enter")
-        time.sleep(1.2)
 
-        # Click the message input area
-        w, h = pyautogui.size()
-        pyautogui.click(w // 2, int(h * 0.90))
+        # Press Enter to open the chat
+        pyautogui.press("enter")
+        time.sleep(1.0)
+
+        # Click the message input area (bottom centre of window)
+        # Get window rect for precise clicking
+        try:
+            import ctypes
+            rect = ctypes.wintypes.RECT()
+            ctypes.windll.user32.GetWindowRect(hwnd, ctypes.byref(rect))
+            win_x = (rect.left + rect.right) // 2
+            win_y = rect.top + int((rect.bottom - rect.top) * 0.92)
+            pyautogui.click(win_x, win_y)
+        except Exception:
+            w, h = pyautogui.size()
+            pyautogui.click(w // 2, int(h * 0.92))
         time.sleep(0.8)
 
-        if has_clipboard:
+        # Type message
+        if has_clip:
             pyperclip.copy(message)
             pyautogui.hotkey("ctrl", "v")
         else:
-            pyautogui.typewrite(message, interval=0.05)
-
-        time.sleep(0.5)
+            for ch in message:
+                pyautogui.press(ch)
+                time.sleep(0.04)
+        time.sleep(0.4)
         pyautogui.press("enter")
+
         return True, f"Message sent to {contact} via {app}"
 
 
@@ -1109,72 +1173,177 @@ class MessagingEngine:
 class SimpleEditorSession:
     """
     Voice control for Notepad, CMD, and PowerShell.
-    - Notepad: create file, write content, open in Notepad
-    - CMD: run commands and show output
-    - PowerShell: run scripts and show output
+
+    Notepad — same functionality as Word:
+      write about X in N words   → NPU generates, writes to file
+      add heading X              → adds formatted heading
+      add bullet list about X    → NPU generates bullets
+      append X                   → NPU generates, appends
+      save as NAME in FOLDER     → saves .txt file
+
+    CMD / PowerShell — commands run IN the open terminal window:
+      run command X             → types X into terminal, presses Enter
+      Result appears in the terminal, not in OPAC.
     """
 
     def __init__(self, app: str = "notepad"):
-        self._app      = app.lower()
+        self._app      = app.lower().strip()
         self._path: Optional[Path] = None
         self._content  = ""
+        self._hwnd     = 0
 
     @property
-    def active(self): return True  # always active once started
+    def active(self): return True
 
     def new(self) -> str:
         if self._app == "notepad":
             import tempfile
-            tf = tempfile.NamedTemporaryFile(suffix=".txt", delete=False, mode="w")
+            tf = tempfile.NamedTemporaryFile(
+                suffix=".txt", delete=False, mode="w", encoding="utf-8")
             self._path    = Path(tf.name)
             self._content = ""
             tf.close()
             _open_file(self._path)
-            return "Notepad is open. Say: write X, append X, save as NAME in downloads."
+            time.sleep(1.0)
+            return ("Notepad is open. Commands: "
+                    "write about X, add heading X, add bullet list about X, "
+                    "append X, save as NAME in FOLDER.")
         elif self._app == "cmd":
-            subprocess.Popen("cmd.exe", creationflags=subprocess.CREATE_NEW_CONSOLE if IS_WINDOWS else 0)
-            return "CMD opened. Say: run command X."
+            if IS_WINDOWS:
+                subprocess.Popen("cmd.exe",
+                    creationflags=subprocess.CREATE_NEW_CONSOLE)
+            else:
+                subprocess.Popen(["x-terminal-emulator"])
+            time.sleep(1.5)
+            return "CMD opened. Say: run command X — it will type and run in the terminal."
         elif self._app in ("powershell", "ps"):
-            subprocess.Popen("powershell.exe",
-                             creationflags=subprocess.CREATE_NEW_CONSOLE if IS_WINDOWS else 0)
-            return "PowerShell opened. Say: run command X."
+            if IS_WINDOWS:
+                subprocess.Popen("powershell.exe",
+                    creationflags=subprocess.CREATE_NEW_CONSOLE)
+            else:
+                subprocess.Popen(["x-terminal-emulator", "-e", "pwsh"])
+            time.sleep(1.5)
+            return "PowerShell opened. Say: run command X — it runs in the terminal."
         return f"Unknown app: {self._app}"
 
+    # ── Notepad content methods ────────────────────────────────────────────────
+
     def write(self, text: str) -> str:
-        """Write (overwrite) content to Notepad file."""
-        if self._app != "notepad":
-            return "Write only supported for Notepad."
+        """Overwrite file content."""
+        if self._app != "notepad": return "Write only for Notepad."
         self._content = text
         self._sync()
         return f"Written ({len(text.split())} words)"
 
-    def append(self, text: str) -> str:
-        """Append content to Notepad file."""
-        if self._app != "notepad":
-            return "Append only supported for Notepad."
-        self._content = (self._content + "\n\n" + text).strip()
+    def append_text(self, text: str) -> str:
+        """Append content with blank line separator."""
+        if self._app != "notepad": return "Append only for Notepad."
+        sep = "\n\n" if self._content.strip() else ""
+        self._content = self._content.rstrip("\n") + sep + text
         self._sync()
         return f"Appended ({len(text.split())} words)"
 
-    def run_command(self, cmd: str) -> str:
-        """Run a command in CMD or PowerShell and return output."""
-        if self._app == "cmd":
-            runner = ["cmd", "/c", cmd]
-        elif self._app in ("powershell", "ps"):
-            runner = ["powershell", "-NoProfile", "-Command", cmd]
-        else:
-            return f"Cannot run commands in {self._app}"
+    def add_heading(self, text: str) -> str:
+        """Add a formatted heading (underlined with ===)."""
+        if self._app != "notepad": return "Headings only for Notepad."
+        bar = "=" * max(len(text), 30)
+        heading = f"\n{bar}\n{text.upper()}\n{bar}\n"
+        sep = "\n" if self._content.strip() else ""
+        self._content = self._content.rstrip("\n") + sep + heading
+        self._sync()
+        return f"Heading added: {text}"
+
+    def add_bullets(self, items: List[str]) -> str:
+        """Add bullet list."""
+        if self._app != "notepad": return "Bullets only for Notepad."
+        bullet_text = "\n".join(f"  • {item.strip()}" for item in items if item.strip())
+        sep = "\n\n" if self._content.strip() else ""
+        self._content = self._content.rstrip("\n") + sep + bullet_text
+        self._sync()
+        return f"Added {len(items)} bullet points"
+
+    # ── CMD / PowerShell — run IN the open terminal ────────────────────────────
+
+    def run_in_terminal(self, command: str) -> str:
+        """
+        Type and run a command in the open CMD or PowerShell window.
+        Result appears in the terminal itself, not in OPAC.
+        """
+        if not IS_WINDOWS:
+            return self._run_subprocess(command)
+
+        # Find terminal window (with retry up to 10s)
+        terminal_keywords = {
+            "cmd":        ["cmd.exe", "command prompt"],
+            "powershell": ["windows powershell", "powershell"],
+            "ps":         ["windows powershell", "powershell"],
+        }
+        keywords = terminal_keywords.get(self._app, [self._app])
+
+        hwnd = 0
+        import ctypes
+        WNDENUMPROC = ctypes.WINFUNCTYPE(ctypes.c_bool, ctypes.c_int, ctypes.c_int)
+        found = [0]
+
+        for _ in range(20):   # up to 10 seconds
+            found[0] = 0
+            def enum_cb(hwnd, _):
+                length = ctypes.windll.user32.GetWindowTextLengthW(hwnd)
+                if length > 0:
+                    buf = ctypes.create_unicode_buffer(length + 1)
+                    ctypes.windll.user32.GetWindowTextW(hwnd, buf, length + 1)
+                    title = buf.value.lower()
+                    if (any(k in title for k in keywords)
+                            and ctypes.windll.user32.IsWindowVisible(hwnd)):
+                        found[0] = hwnd
+                        return False
+                return True
+            ctypes.windll.user32.EnumWindows(WNDENUMPROC(enum_cb), 0)
+            hwnd = found[0]
+            if hwnd: break
+            time.sleep(0.5)
+
+        if not hwnd:
+            return f"Terminal window not found. Showing output here instead:\n{self._run_subprocess(command)}"
+
+        # Focus window
+        u32 = ctypes.windll.user32
+        u32.ShowWindow(hwnd, 9)
+        u32.SetForegroundWindow(hwnd)
+        time.sleep(0.5)
+
+        # Paste command using clipboard (handles special characters)
         try:
-            result = subprocess.run(runner, capture_output=True, text=True, timeout=30)
-            out = (result.stdout + result.stderr).strip()[:500]
-            return f"Output: {out}" if out else "Command completed (no output)"
-        except subprocess.TimeoutExpired:
-            return "Command timed out after 30 seconds"
+            import pyperclip
+            pyperclip.copy(command)
+            import pyautogui
+            pyautogui.hotkey("ctrl", "v")
+        except Exception:
+            try:
+                import pyautogui
+                pyautogui.typewrite(command, interval=0.04)
+            except Exception:
+                return self._run_subprocess(command)
+
+        import pyautogui
+        pyautogui.press("enter")
+        return f"Command sent to {self._app} terminal: {command}"
+
+    def _run_subprocess(self, command: str) -> str:
+        """Fallback: run in subprocess and return output to OPAC."""
+        if self._app == "cmd":
+            runner = ["cmd", "/c", command]
+        else:
+            runner = ["powershell", "-NoProfile", "-Command", command]
+        try:
+            r = subprocess.run(runner, capture_output=True, text=True, timeout=30)
+            return (r.stdout + r.stderr).strip()[:800] or "(no output)"
         except Exception as e:
             return f"Error: {e}"
 
+    # ── Save ──────────────────────────────────────────────────────────────────
+
     def save(self, name: str, folder: str) -> Tuple[bool, str]:
-        """Save Notepad content to a named file."""
         if self._app != "notepad":
             return False, f"Save not applicable for {self._app}"
         path = _resolve_path(name, folder, ".txt")
@@ -1196,7 +1365,7 @@ class SimpleEditorSession:
         return f"{self._app.title()}: active"
 
     def _sync(self):
-        """Write current content to the temp file (Notepad auto-detects change)."""
+        """Write content to temp file so Notepad refreshes."""
         if self._path:
             try:
                 self._path.write_text(self._content, encoding="utf-8")
@@ -1204,15 +1373,22 @@ class SimpleEditorSession:
                 pass
 
 
+
+
+# ======================================================================
+# OFFICE MANAGER
+# ======================================================================
 class OfficeManager:
     def __init__(self):
-        self.word:    Optional[WordSession]       = None
-        self.pptx:    Optional[PowerPointSession] = None
-        self.excel:   Optional[ExcelSession]      = None
-        self.browser: Optional[BrowserSession]    = None
-        self.vscode:  Optional[VSCodeSession]     = None
+        self.word:    Optional[WordSession]         = None
+        self.pptx:    Optional[PowerPointSession]   = None
+        self.excel:   Optional[ExcelSession]        = None
+        self.browser: Optional[BrowserSession]      = None
+        self.vscode:  Optional[VSCodeSession]       = None
         self.editor:  Optional[SimpleEditorSession] = None
         self.msg      = MessagingEngine()
+
+    # ── Word ──────────────────────────────────────────────────────────────────
 
     def start_word(self, path: str = "") -> str:
         self.word = WordSession()
@@ -1242,6 +1418,8 @@ class OfficeManager:
         if cmd == "status": return w.summary()
         return f"Unknown: {cmd}"
 
+    # ── PowerPoint ────────────────────────────────────────────────────────────
+
     def start_pptx(self, title: str = "", path: str = "") -> str:
         self.pptx = PowerPointSession()
         return self.pptx.open_existing(path) if path else self.pptx.new(title)
@@ -1253,16 +1431,19 @@ class OfficeManager:
         if cmd == "bullet_slide":
             items = [l.strip() for l in content.split("\n") if l.strip()]
             return p.add_bullet_slide(extra.get("title","Slide"), items)
-        if cmd == "title_slide":   return p.add_title_slide(content, extra.get("subtitle","")) if hasattr(p, 'add_title_slide') else p.new(content)
+        if cmd == "title_slide":   return p.add_title_slide(content, extra.get("subtitle",""))
         if cmd == "section_slide": return p.add_section_slide(content)
         if cmd == "blank_slide":   return p.add_blank_slide()
         if cmd == "save":
             ok,msg = p.save(extra.get("name","presentation"), extra.get("folder","downloads"))
-            if ok: self.pptx = None; return msg
+            if ok: self.pptx = None
+            return msg
         if cmd == "close":
             msg = p.close(); self.pptx = None; return msg
         if cmd == "status": return p.summary()
         return f"Unknown: {cmd}"
+
+    # ── Excel ─────────────────────────────────────────────────────────────────
 
     def start_excel(self, path: str = "") -> str:
         self.excel = ExcelSession()
@@ -1279,21 +1460,27 @@ class OfficeManager:
         if cmd == "sheet":  return e.create_sheet(content)
         if cmd == "save":
             ok,msg = e.save(extra.get("name","spreadsheet"), extra.get("folder","downloads"))
-            if ok: self.excel = None; return msg
+            if ok: self.excel = None
+            return msg
         if cmd == "close":
             msg = e.close(); self.excel = None; return msg
         if cmd == "status": return e.summary()
         return f"Unknown: {cmd}"
 
+    # ── VS Code ───────────────────────────────────────────────────────────────
+
     def start_vscode(self, editor: str = "vscode", path: str = "") -> str:
-        if not self.vscode: self.vscode = VSCodeSession(editor)
+        if not self.vscode:
+            self.vscode = VSCodeSession(editor)
         return self.vscode.open_existing(path) if path else self.vscode.open_editor()
 
     def vscode_cmd(self, cmd: str, content: str, extra: dict = None) -> str:
         if not self.vscode: self.vscode = VSCodeSession()
         extra = extra or {}; vs = self.vscode
         if cmd == "create":
-            return vs.create_file(extra.get("name","untitled"), extra.get("language","python"), extra.get("folder","documents"))
+            return vs.create_file(extra.get("name","untitled"),
+                                  extra.get("language","python"),
+                                  extra.get("folder","documents"))
         if cmd == "open":    return vs.open_existing(content)
         if cmd == "append":  return vs.append_code(content)
         if cmd == "replace": return vs.replace_content(content)
@@ -1304,34 +1491,35 @@ class OfficeManager:
         if cmd == "status":  return vs.summary()
         return f"Unknown: {cmd}"
 
+    # ── Simple Editor (Notepad / CMD / PowerShell) ────────────────────────────
+
     def start_editor(self, app: str = "notepad") -> str:
-        """Start Notepad, CMD, or PowerShell session."""
         self.editor = SimpleEditorSession(app)
         return self.editor.new()
 
     def editor_cmd(self, cmd: str, content: str, extra: dict = None) -> str:
-        """Route a command to the simple editor session."""
         if not self.editor: return "No editor open. Say 'open notepad' first."
         extra = extra or {}
-        if cmd == "write":   return self.editor.write(content)
-        if cmd == "append":  return self.editor.append(content)
-        if cmd == "run":     return self.editor.run_command(content)
+        if cmd == "write":    return self.editor.write(content)
+        if cmd == "append":   return self.editor.append_text(content)
+        if cmd == "heading":  return self.editor.add_heading(content)
+        if cmd == "bullets":
+            items = [l.strip() for l in content.split("\n") if l.strip()]
+            return self.editor.add_bullets(items)
+        if cmd == "run":      return self.editor.run_in_terminal(content)
         if cmd == "save":
             ok, msg = self.editor.save(extra.get("name","notes"), extra.get("folder","downloads"))
             if ok: self.editor = None
             return msg
         if cmd == "close":
             msg = self.editor.close(); self.editor = None; return msg
-        if cmd == "status":  return self.editor.summary()
+        if cmd == "status":   return self.editor.summary()
         return f"Unknown editor command: {cmd}"
 
+    # ── Browser ───────────────────────────────────────────────────────────────
+
     def start_browser(self, name: str = "chrome", profile: str = "",
-                      for_automation: bool = True) -> Tuple[bool,str]:
-        """
-        Open browser.
-        for_automation=True  → Playwright controlled (OPAC can search/navigate)
-        for_automation=False → subprocess (normal window, extensions, profile)
-        """
+                      for_automation: bool = True) -> Tuple[bool, str]:
         if for_automation:
             if self.browser and self.browser.active:
                 try: self.browser.close()
@@ -1339,11 +1527,8 @@ class OfficeManager:
             self.browser = BrowserSession()
             return self.browser.open(name, profile)
         else:
-            # Just open normally — no Playwright
             b = BrowserSession()
-            ok, msg = b.open_normal(name, profile)
-            # Don't assign to self.browser — no automation session
-            return ok, msg
+            return b.open_normal(name, profile)
 
     def browser_cmd(self, cmd: str, content: str = "") -> Tuple[bool, str]:
         if not self.browser or not self.browser.active:
@@ -1362,10 +1547,14 @@ class OfficeManager:
             msg = b.close(); self.browser = None; return True, msg
         return False, f"Unknown: {cmd}"
 
+    # ── Messaging ─────────────────────────────────────────────────────────────
+
     def send_message(self, app: str, contact: str, message: str) -> Tuple[bool, str]:
-        if app.lower()=="whatsapp" and self.browser and self.browser.active:
+        if app.lower() == "whatsapp" and self.browser and self.browser.active:
             return self.browser.whatsapp_send(contact, message)
         return self.msg.send_desktop(app, contact, message)
+
+    # ── Status / close all ────────────────────────────────────────────────────
 
     def status(self) -> str:
         parts = []
@@ -1373,8 +1562,8 @@ class OfficeManager:
         if self.pptx:                            parts.append(self.pptx.summary())
         if self.excel:                           parts.append(self.excel.summary())
         if self.vscode:                          parts.append(self.vscode.summary())
-        if self.browser and self.browser.active: parts.append("Browser: open (OPAC controlled)")
         if self.editor:                          parts.append(self.editor.summary())
+        if self.browser and self.browser.active: parts.append("Browser: open (OPAC controlled)")
         return "\n  ".join(parts) if parts else "No active sessions."
 
     def close_all(self):
@@ -1382,17 +1571,18 @@ class OfficeManager:
             if s:
                 try: s.close()
                 except Exception: pass
-        self.word = self.pptx = self.excel = self.vscode = None
+        self.word = self.pptx = self.excel = self.vscode = self.editor = None
         if self.browser:
             try: self.browser.close()
             except Exception: pass
         self.browser = None
 
 
-# ── Helpers ───────────────────────────────────────────────────────────
+# ── Helpers ───────────────────────────────────────────────────────────────────
 
 def _parse_row(text: str) -> list:
-    parts = re.split(r"[,\t]+|\s{2,}", text.strip())
+    import re as _re
+    parts = _re.split(r"[,\t]+|\s{2,}", text.strip())
     result = []
     for p in parts:
         p = p.strip()
@@ -1405,18 +1595,20 @@ def _parse_row(text: str) -> list:
 
 
 def parse_save(text: str) -> Tuple[str, str]:
-    m = re.search(r"save\s+(?:as\s+)?(.+?)\s+(?:in|to|into|at)\s+(\w+)\s*$", text, re.I)
+    import re as _re
+    m = _re.search(r"save\s+(?:as\s+)?(.+?)\s+(?:in|to|into|at)\s+(\w+)\s*$", text, _re.I)
     if m: return m.group(1).strip(), m.group(2).lower()
-    m = re.search(r"save\s+(?:as\s+)?(.+)$", text, re.I)
+    m = _re.search(r"save\s+(?:as\s+)?(.+)$", text, _re.I)
     if m: return m.group(1).strip(), "downloads"
     return "document", "downloads"
 
 
 def parse_slide(text: str) -> Tuple[str, str]:
-    m = re.search(r"title\s+(.+?)\s+and\s+content\s+(.+)$", text, re.I)
+    import re as _re
+    m = _re.search(r"title\s+(.+?)\s+and\s+content\s+(.+)$", text, _re.I)
     if m: return m.group(1).strip(), m.group(2).strip()
-    m = re.search(r"(?:about|on|covering|for)\s+(.+)$", text, re.I)
+    m = _re.search(r"(?:about|on|covering|for)\s+(.+)$", text, _re.I)
     if m: t = m.group(1).strip(); return t.title(), t
-    m = re.search(r"called\s+(.+)$", text, re.I)
+    m = _re.search(r"called\s+(.+)$", text, _re.I)
     if m: t = m.group(1).strip(); return t, t
     return "Slide", text
