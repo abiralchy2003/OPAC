@@ -60,7 +60,9 @@ _VSCODE_CMDS    = re.compile(
     r"run (?:the )?file|run it|save (?:the )?file|close (?:vs\s*code|vscode)|"
     r"vs\s*code status)", re.I)
 _INTENT_MSG     = re.compile(
-    r"^(?:open\s+)?(?:message|send|text)\s+(?:via\s+)?(\w+)\s+(?:to\s+)?(.+?)\s+(.+)$", re.I)
+    r"^(?:send\s+)?(?:message|msg)\s+(?:to\s+)?(.+?)\s+(.+)$", re.I)
+_INTENT_SEND_APP = re.compile(
+    r"^(?:send\s+)?(?:via\s+|through\s+|using\s+)?(viber|telegram|discord|skype|signal)\s+(?:to\s+)?(.+?)\s+(.+)$", re.I)
 _INTENT_WHATSAPP = re.compile(
     r"^(?:send\s+)?whatsapp\s+(?:to\s+)?(.+?)\s+(.+)$", re.I)
 
@@ -522,7 +524,7 @@ class OPACAgent:
         if m:
             contact, message = m.group(1).strip(), m.group(2).strip()
             self.start()
-            ok, msg = self._get_office().browser_cmd("whatsapp", f"{contact}|{message}")
+            ok, msg = self._get_office().send_message("whatsapp", contact, message)
             print(f"\n  OPAC: {msg}\n"); self._tts_speak(msg); return
 
         # Messaging (Viber, Telegram etc.)
@@ -809,75 +811,113 @@ class OPACAgent:
 
     def _handle_editor_continuation(self, txt: str):
         """Route commands to active Notepad/CMD/PowerShell session."""
+        import re as _r
         office = self._get_office()
-        tl     = txt.lower().strip()
+        tl = txt.lower().strip()
 
-        if re.match(r"close (?:notepad|cmd|powershell|ps)", tl):
+        if _r.match(r"close (notepad|cmd|powershell|ps)", tl):
             msg = office.editor_cmd("close", "")
             print(f"\n  OPAC: {msg}\n"); self._tts_speak(msg); return
 
         if "save as" in tl or tl.startswith("save"):
             from actions.office import parse_save
-            name, folder = parse_save(txt)
-            msg = office.editor_cmd("save", "", {"name": name, "folder": folder})
+            n, f_ = parse_save(txt)
+            msg = office.editor_cmd("save", "", {"name": n, "folder": f_})
             print(f"\n  OPAC: {msg}\n"); self._tts_speak(msg); return
 
-        if re.match(r"run (?:command|this|it)?", tl):
-            cmd_text = re.sub(r"(?i)^run\s+(?:command\s+)?", "", txt).strip()
+        if _r.match(r"run (command|this|it)?", tl):
+            cmd_text = _r.sub(r"(?i)^run\s+(?:command\s+)?", "", txt).strip()
             msg = office.editor_cmd("run", cmd_text)
             print(f"\n  OPAC: {msg}\n"); self._tts_speak(msg); return
 
-        if re.match(r"append|add to", tl):
-            content = re.sub(r"(?i)^(?:append|add to)\s+", "", txt).strip()
-            # Generate via NPU if it's a topic not literal text
-            if len(content.split()) < 4:
-                content = self._generate_text(f"Write a paragraph about: {content}")
+        if _r.match(r"add (a )?heading", tl):
+            h = _r.sub(r"(?i)^add\s+(?:a\s+)?heading\s*", "", txt).strip()
+            msg = office.editor_cmd("heading", h)
+            print(f"\n  OPAC: {msg}\n"); self._tts_speak(msg); return
+
+        if _r.match(r"add (a )?(bullet|list)", tl):
+            topic = _r.sub(r"(?i)^add\s+(?:a\s+)?(?:bullet\s+)?(?:list\s+)?(?:about|on|for)?\s*", "", txt).strip()
+            print(f"\n  [OPAC] Generating bullets ...", flush=True)
+            content = self._generate_text(
+                f"Write 5 concise bullet points about: {topic}. One per line, plain text only.")
+            msg = office.editor_cmd("bullets", content)
+            print(f"\n  OPAC: {msg}\n"); self._tts_speak(msg); return
+
+        if _r.match(r"append|add to", tl):
+            topic = _r.sub(r"(?i)^(?:append|add\s+to)\s+(?:about\s+)?", "", txt).strip()
+            m2 = _r.search(r"in (\d+) words?", topic, _r.I)
+            wc = int(m2.group(1)) if m2 else 0
+            if m2: topic = topic[:m2.start()].strip()
+            print(f"\n  [OPAC] Generating content ...", flush=True)
+            prompt = f"Write a paragraph about: {topic}."
+            if wc: prompt += f" Write exactly {wc} words."
+            content = self._generate_text(prompt, max_words=wc)
             msg = office.editor_cmd("append", content)
             print(f"\n  OPAC: {msg}\n"); self._tts_speak(msg); return
 
-        # Default: write/type content
-        content = re.sub(r"(?i)^(?:write|type|add|say)\s+", "", txt).strip()
-        if len(content.split()) < 4:
-            print(f"\n  [OPAC] Generating content ...", flush=True)
-            content = self._generate_text(f"Write a short paragraph about: {content}")
-        msg = office.editor_cmd("write", content)
+        # Default: write — strip "write about" then generate on NPU
+        topic = _r.sub(r"(?i)^(?:write|type|add)\s+(?:about\s+)?", "", txt).strip()
+        m2 = _r.search(r"in (\d+) words?", topic, _r.I)
+        wc = int(m2.group(1)) if m2 else 0
+        if m2: topic = topic[:m2.start()].strip()
+        print(f"\n  [OPAC] Generating content ...", flush=True)
+        prompt = f"Write a paragraph about: {topic}."
+        if wc: prompt += f" Write exactly {wc} words."
+        content = self._generate_text(prompt, max_words=wc)
+        es = office.editor
+        if es and es._content.strip():
+            msg = office.editor_cmd("append", content)
+        else:
+            msg = office.editor_cmd("write", content)
         print(f"\n  OPAC: {msg}\n"); self._tts_speak(msg)
 
     def _handle_browser_continuation(self, txt: str):
-        """Route a command to the active browser session."""
+        """Route a command to the active browser session.
+        Auto-connects via CDP if no Playwright session is active."""
+        import re as _re
         office = self._get_office()
         tl     = txt.lower().strip()
 
-        if re.match(r"close browser", tl):
-            _, msg = office.browser_cmd("close"); self._tts_speak(msg); return
+        # If no active Playwright session, try CDP first
+        if not (office.browser and office.browser.active):
+            from actions.office import BrowserSession
+            b = BrowserSession()
+            ok, _ = b.connect_cdp()
+            if ok:
+                office.browser = b
+                print("  [OPAC] Connected to running browser", flush=True)
+            else:
+                print("\n  OPAC: No browser available. "
+                      "Open a browser with 'open chrome and search X'.\n")
+                return
 
-        if re.match(r"(?:search|look up)\s+(?:youtube|on youtube)\s+(?:for\s+)?(.+)", tl):
-            m = re.search(r"(?:youtube|on youtube)\s+(?:for\s+)?(.+)$", tl, re.I)
-            if m:
-                ok, msg = office.browser_cmd("search_youtube", m.group(1).strip())
-                print(f"\n  OPAC: {msg}\n"); self._tts_speak(msg); return
+        if _re.match(r"close browser", tl):
+            _, msg = office.browser_cmd("close")
+            self._tts_speak(msg); return
 
-        if re.match(r"search\s+(?:for\s+)?(.+)", tl):
-            m = re.search(r"search\s+(?:for\s+)?(.+)$", tl, re.I)
-            if m:
-                ok, msg = office.browser_cmd("search", m.group(1).strip())
-                print(f"\n  OPAC: {msg}\n"); self._tts_speak(msg); return
+        m = _re.search(r"(?:search|look up)\s+(?:on\s+)?youtube\s+(?:for\s+)?(.+)$", tl, _re.I)
+        if m:
+            ok, msg = office.browser_cmd("search_youtube", m.group(1).strip())
+            print(f"\n  OPAC: {msg}\n"); self._tts_speak(msg); return
 
-        if re.match(r"(?:go to|navigate to|open)\s+(.+)", tl):
-            m = re.search(r"(?:go to|navigate to|open)\s+(.+)$", tl, re.I)
-            if m:
-                ok, msg = office.browser_cmd("navigate", m.group(1).strip())
-                print(f"\n  OPAC: {msg}\n"); self._tts_speak(msg); return
+        m = _re.search(r"search\s+(?:for\s+)?(.+)$", tl, _re.I)
+        if m:
+            ok, msg = office.browser_cmd("search", m.group(1).strip())
+            print(f"\n  OPAC: {msg}\n"); self._tts_speak(msg); return
 
-        if re.match(r"(?:open\s+)?new tab", tl):
+        m = _re.search(r"(?:go to|navigate to|open)\s+(.+)$", tl, _re.I)
+        if m:
+            ok, msg = office.browser_cmd("navigate", m.group(1).strip())
+            print(f"\n  OPAC: {msg}\n"); self._tts_speak(msg); return
+
+        if _re.match(r"(?:open\s+)?new tab", tl):
             ok, msg = office.browser_cmd("new_tab")
             print(f"\n  OPAC: {msg}\n"); self._tts_speak(msg); return
 
-        if re.match(r"read (?:this )?page|what is on this page", tl):
+        if _re.match(r"read (?:this )?page|what is on this page", tl):
             ok, text = office.browser_cmd("read")
-            print(f"\n  OPAC: Summarising page ...\n"); self._summarize_text(text); return
-
-    # ── Wikipedia ──────────────────────────────────────────────────────────────
+            print(f"\n  OPAC: Summarising page ...\n")
+            self._summarize_text(text); return
 
     def _do_wiki_search(self, query: str):
         if not self._wiki or not self._wiki.available:
