@@ -684,16 +684,19 @@ class VSCodeSession:
 # ======================================================================
 class BrowserSession:
     """
-    Two-mode browser control:
-      - open_normal()  : launches browser via subprocess (normal window, user profile, extensions)
-      - open_playwright() : launches Playwright-controlled instance for OPAC automation
-      - connect_cdp()  : connects to an already-running browser via remote debug port (best of both)
+    Browser control via subprocess — no Playwright, no asyncio conflicts.
 
-    Incognito fix: Playwright by default strips the user profile.
-    We fix this by passing --user-data-dir to point to the real Chrome profile folder.
+    Strategy:
+      - open()        : launch browser normally via subprocess
+      - navigate()    : pass URL as argument to browser exe
+      - search_*()    : build URL and pass to browser exe
+      - new_tab()     : open browser with --new-tab flag
+      - whatsapp_send(): open WhatsApp Web URL, then pyautogui
 
-    www.chrome / www.brave fix: never navigate to chrome:// or brave:// URLs.
-    Use https:// equivalents instead.
+    Why not Playwright:
+      httpx (used by Wikipedia API) leaves an asyncio event loop running.
+      Playwright sync API cannot start inside an existing loop.
+      subprocess avoids ALL of these issues and works with real profiles.
     """
 
     EXE_PATHS = {
@@ -710,296 +713,202 @@ class BrowserSession:
             r"C:\Program Files (x86)\BraveSoftware\Brave-Browser\Application\brave.exe",
         ],
     }
-
     USER_DATA_DIRS = {
         "chrome": Path.home() / "AppData/Local/Google/Chrome/User Data",
         "edge":   Path.home() / "AppData/Local/Microsoft/Edge/User Data",
         "brave":  Path.home() / "AppData/Local/BraveSoftware/Brave-Browser/User Data",
     }
 
-    # Safe HTTPS new-tab equivalents (never use chrome:// / brave:// — Playwright blocks them)
-    HOME_URLS = {
-        "chrome": "https://www.google.com",
-        "edge":   "https://www.bing.com",
-        "brave":  "https://search.brave.com",
-    }
-
     def __init__(self):
-        self._browser = self._context = self._page = self._pw = None
-        self._name    = ""
-        self._normal_proc = None   # subprocess handle when opened normally
+        self._exe  = ""
+        self._name = ""
+        self._page = None   # Playwright page (only for summarize tab)
+        self._pw   = None
+        self._context = None
+        self._browser = None
 
     @property
-    def active(self): return self._page is not None
+    def active(self):
+        # Active as long as we have an exe to use
+        return bool(self._exe)
 
-    # ── Open normally (subprocess) ─────────────────────────────────────────────
+    def _find_exe(self, name: str) -> str:
+        for path in self.EXE_PATHS.get(name, []):
+            if Path(path).exists():
+                return path
+        import shutil
+        return shutil.which(name) or shutil.which(name + ".exe") or ""
 
-    def open_normal(self, name: str = "chrome", profile: str = "") -> Tuple[bool, str]:
+    def _popen(self, args: list):
+        """Launch process detached so it doesn't block OPAC."""
+        flags = subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP if IS_WINDOWS else 0
+        subprocess.Popen(args, creationflags=flags,
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+    def _open_url(self, url: str):
+        """Open a URL in the current browser."""
+        if self._exe:
+            self._popen([self._exe, url])
+        else:
+            import webbrowser
+            webbrowser.open(url)
+
+    # ── Open browser ──────────────────────────────────────────────────────────
+
+    def open(self, name: str = "chrome", profile: str = "") -> Tuple[bool, str]:
         """
-        Open browser exactly like a user double-clicking it.
-        Uses subprocess — preserves extensions, theme, default profile.
-        No Playwright — no incognito look, no www.chrome issue.
+        Launch browser normally via subprocess with optional profile.
+        No Playwright involved — user's real browser with real profile.
         """
         name = name.lower().strip()
-        exe  = next((p for p in self.EXE_PATHS.get(name, []) if Path(p).exists()), None)
+        exe  = self._find_exe(name)
         if not exe:
-            import shutil
-            exe = shutil.which(name) or shutil.which(name + ".exe")
-        if not exe:
-            return False, f"Cannot find {name}. Make sure it is installed."
+            return False, f"{name} not found. Is it installed?"
+
+        self._exe  = exe
+        self._name = name
 
         args = [exe]
         if profile:
             pdir = self._resolve_profile_dir(name, profile)
-            if pdir:
-                udir = self.USER_DATA_DIRS.get(name, "")
-                if udir:
-                    args.append(f"--user-data-dir={udir}")
-                args.append(f"--profile-directory={pdir}")
-
-        try:
-            flags = subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP if IS_WINDOWS else 0
-            self._normal_proc = subprocess.Popen(args, creationflags=flags)
-            self._name = name
-            profile_msg = f" (profile: {profile})" if profile else ""
-            return True, f"Opened {name.title()}{profile_msg}"
-        except Exception as e:
-            return False, f"Cannot open {name}: {e}"
-
-    # ── Open with Playwright (for OPAC automation) ─────────────────────────────
-
-    def open(self, name: str = "chrome", profile: str = "") -> Tuple[bool, str]:
-        """
-        Launch browser via subprocess with --remote-debugging-port=9222,
-        then connect via Chrome DevTools Protocol (CDP).
-
-        Benefits:
-        - Browser opens completely normally (real profile, extensions, theme)
-        - No Playwright launch = no --user-data-dir error, no asyncio conflict
-        - OPAC connects for full automation after browser starts
-        - Works with Chrome, Edge, Brave identically
-        """
-        name = name.lower().strip()
-        self._name = name
-        exe  = next((p for p in self.EXE_PATHS.get(name, []) if Path(p).exists()), None)
-        if not exe:
-            import shutil
-            exe = shutil.which(name) or shutil.which(name + ".exe")
-        if not exe:
-            return False, f"{name} not found. Is it installed?"
-
-        # Build subprocess args
-        debug_port = 9222
-        launch_args = [exe, f"--remote-debugging-port={debug_port}", "--no-first-run"]
-
-        if profile:
-            pdir = self._resolve_profile_dir(name, profile)
             udir = self.USER_DATA_DIRS.get(name)
             if pdir and udir and udir.exists():
-                launch_args += [f"--user-data-dir={udir}",
-                                f"--profile-directory={pdir}"]
+                args += [f"--user-data-dir={udir}", f"--profile-directory={pdir}"]
 
-        # Launch browser normally with debug port
-        try:
-            flags = subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP if IS_WINDOWS else 0
-            subprocess.Popen(launch_args, creationflags=flags)
-        except Exception as e:
-            return False, f"Cannot launch {name}: {e}"
+        self._popen(args)
+        profile_msg = f" (profile: {profile})" if profile else ""
+        return True, f"Opened {name.title()}{profile_msg}"
 
-        # Wait for browser to start accepting CDP connections
-        import socket
-        for _ in range(20):   # up to 10 seconds
-            time.sleep(0.5)
-            try:
-                with socket.create_connection(("localhost", debug_port), timeout=0.5):
-                    break
-            except OSError:
-                continue
+    def open_normal(self, name: str = "chrome", profile: str = "") -> Tuple[bool, str]:
+        """Alias for open() — same behaviour."""
+        return self.open(name, profile)
 
-        # Connect via CDP
-        try:
-            from playwright.sync_api import sync_playwright
-        except ImportError:
-            # Browser opened but OPAC can't control it — still useful
-            return True, f"Opened {name.title()} (install playwright for OPAC control)"
-
-        try:
-            self._pw      = sync_playwright().start()
-            self._browser = self._pw.chromium.connect_over_cdp(
-                f"http://localhost:{debug_port}")
-            contexts = self._browser.contexts
-            if contexts:
-                self._context = contexts[0]
-                pages = self._context.pages
-                self._page = pages[0] if pages else self._context.new_page()
-            else:
-                self._context = self._browser.new_context()
-                self._page    = self._context.new_page()
-
-            profile_msg = f" (profile: {profile})" if profile else ""
-            return True, f"Opened {name.title()}{profile_msg} — OPAC connected"
-        except Exception as e:
-            # Browser opened fine even if OPAC connection failed
-            logger.warning(f"CDP connect failed: {e}")
-            return True, f"Opened {name.title()} (OPAC control unavailable: {e})"
-
-    # ── Connect to already-running browser via CDP ─────────────────────────────
-
-    def connect_cdp(self, port: int = 9222) -> Tuple[bool, str]:
-        """
-        Connect to a browser already running with --remote-debugging-port=9222.
-        Best approach: user starts browser normally, OPAC connects and controls it.
-        Start Chrome with: chrome.exe --remote-debugging-port=9222
-        """
-        try:
-            from playwright.sync_api import sync_playwright
-        except ImportError:
-            raise ImportError("pip install playwright && playwright install chromium")
-        try:
-            self._pw      = sync_playwright().start()
-            browser       = self._pw.chromium.connect_over_cdp(f"http://localhost:{port}")
-            self._browser = browser
-            self._context = browser.contexts[0]
-            self._page    = self._context.pages[0] if self._context.pages else self._context.new_page()
-            return True, f"Connected to browser on port {port}"
-        except Exception as e:
-            return False, f"Cannot connect (is browser running with --remote-debugging-port={port}?): {e}"
-
-    # ── Navigation commands ────────────────────────────────────────────────────
+    # ── Navigation ────────────────────────────────────────────────────────────
 
     def navigate(self, url: str) -> Tuple[bool, str]:
-        if not url.startswith("http"): url = "https://" + url
-        self._page.goto(url, timeout=20000)
-        return True, f"Navigated to {self._page.title()}"
+        if not url.startswith("http"):
+            url = "https://" + url
+        self._open_url(url)
+        return True, f"Opening {url}"
 
     def search_google(self, q: str) -> Tuple[bool, str]:
-        self._page.goto(f"https://www.google.com/search?q={q.replace(' ','+')}", timeout=15000)
-        return True, f"Searched Google: {q}"
+        import urllib.parse
+        url = "https://www.google.com/search?q=" + urllib.parse.quote_plus(q)
+        self._open_url(url)
+        return True, f"Searching Google: {q}"
 
     def search_youtube(self, q: str) -> Tuple[bool, str]:
-        self._page.goto(f"https://www.youtube.com/results?search_query={q.replace(' ','+')}",
-                        timeout=15000)
-        return True, f"Searched YouTube: {q}"
+        import urllib.parse
+        url = "https://www.youtube.com/results?search_query=" + urllib.parse.quote_plus(q)
+        self._open_url(url)
+        return True, f"Searching YouTube: {q}"
 
     def new_tab(self, url: str = "") -> Tuple[bool, str]:
-        self._page = self._context.new_page()
-        home = self.HOME_URLS.get(self._name, "https://www.google.com")
-        target = url if (url and url.startswith("http")) else home
-        try:
-            self._page.goto(target, timeout=8000)
-        except Exception:
-            pass
+        if url and url.startswith("http"):
+            self._open_url(url)
+            return True, f"Opened tab: {url}"
+        if self._exe:
+            self._popen([self._exe, "--new-tab"])
         return True, "New tab opened"
 
     def get_page_text(self) -> str:
-        try:
-            return self._page.evaluate("""() => {
-                ['script','style','nav','footer','header','aside']
-                    .forEach(t=>document.querySelectorAll(t).forEach(e=>e.remove()));
-                return document.body.innerText || '';
-            }""")[:3000]
-        except Exception:
-            return ""
+        """Try to get page text via CDP/Playwright (optional, for summarize tab)."""
+        if self._page:
+            try:
+                return self._page.evaluate("""() => {
+                    ['script','style','nav','footer','header']
+                        .forEach(t=>document.querySelectorAll(t).forEach(e=>e.remove()));
+                    return document.body.innerText||'';
+                }""")[:3000]
+            except Exception:
+                pass
+        return ""
 
-    # ── WhatsApp Web ───────────────────────────────────────────────────────────
+    # ── WhatsApp Web ──────────────────────────────────────────────────────────
 
     def whatsapp_send(self, contact: str, message: str) -> Tuple[bool, str]:
         """
-        Send WhatsApp message via WhatsApp Web.
-        Uses multiple selector strategies for robustness.
+        Open WhatsApp Web and send message via pyautogui.
+        Opens wa.me deeplink which goes directly to the chat if contact is a number,
+        otherwise opens the search.
         """
-        try:
-            self._page.goto("https://web.whatsapp.com", timeout=30000)
-        except Exception as e:
-            return False, f"Cannot open WhatsApp Web: {e}"
+        # Try wa.me deeplink for phone numbers
+        if re.match(r"^\+?[\d\s\-]{7,}$", contact):
+            phone = re.sub(r"[\s\-]", "", contact).lstrip("+")
+            import urllib.parse
+            url = f"https://wa.me/{phone}?text={urllib.parse.quote_plus(message)}"
+            self._open_url(url)
+            return True, f"WhatsApp deeplink opened for {contact}"
 
-        # Wait for WhatsApp to fully load (accepts multiple possible selectors)
-        loaded = False
-        for selector in ['[data-testid="chat-list"]', '#pane-side', 'div[aria-label="Chat list"]']:
-            try:
-                self._page.wait_for_selector(selector, timeout=35000)
-                loaded = True
-                break
-            except Exception:
-                continue
-
-        if not loaded:
-            return False, "WhatsApp Web did not load. Scan the QR code first if needed."
-
-        time.sleep(1)
-
-        # Find the search box (multiple selectors for different WA Web versions)
-        search_box = None
-        for sel in ['[data-testid="search"]',
-                    'div[contenteditable="true"][data-tab="3"]',
-                    'div[aria-label="Search input textbox"]',
-                    'div[title="Search input textbox"]']:
-            search_box = self._page.query_selector(sel)
-            if search_box:
-                break
-
-        if not search_box:
-            return False, "Cannot find WhatsApp search box"
+        # For contact names: open WhatsApp Web then use pyautogui
+        self._open_url("https://web.whatsapp.com")
+        time.sleep(6)
 
         try:
-            search_box.click()
-            time.sleep(0.5)
-            search_box.fill(contact)
+            import pyautogui, pyperclip
+            pyautogui.FAILSAFE = False
+            # Search for contact using keyboard shortcut
+            pyautogui.hotkey("ctrl", "alt", "n") if IS_WINDOWS else None
+            time.sleep(1)
+            # Click search
+            pyautogui.hotkey("ctrl", "f")
+            time.sleep(1)
+            pyperclip.copy(contact)
+            pyautogui.hotkey("ctrl", "v")
             time.sleep(2)
-
-            # Click first result
-            result = None
-            for sel in ['[data-testid="cell-frame-container"]',
-                        'div[aria-label*="' + contact[:10] + '"]',
-                        'span[title="' + contact + '"]']:
-                result = self._page.query_selector(sel)
-                if result:
-                    break
-
-            if not result:
-                return False, f"Contact '{contact}' not found in WhatsApp"
-
-            result.click()
+            pyautogui.press("enter")
             time.sleep(1.5)
-
-            # Find message box
-            msg_box = None
-            for sel in ['[data-testid="conversation-compose-box-input"]',
-                        'div[contenteditable="true"][data-tab="10"]',
-                        'div[aria-label="Type a message"]',
-                        'footer div[contenteditable="true"]']:
-                msg_box = self._page.query_selector(sel)
-                if msg_box:
-                    break
-
-            if not msg_box:
-                return False, "Cannot find WhatsApp message box"
-
-            msg_box.click()
+            # Click message box and type
+            w, h = pyautogui.size()
+            pyautogui.click(w // 2, int(h * 0.92))
+            time.sleep(0.8)
+            pyperclip.copy(message)
+            pyautogui.hotkey("ctrl", "v")
             time.sleep(0.3)
-            msg_box.fill(message)
-            time.sleep(0.3)
-            msg_box.press("Enter")
+            pyautogui.press("enter")
             return True, f"WhatsApp message sent to {contact}"
-
+        except ImportError:
+            return True, f"WhatsApp Web opened (install pyautogui for auto-send)"
         except Exception as e:
             return False, f"WhatsApp error: {e}"
 
     # ── Close ─────────────────────────────────────────────────────────────────
 
     def close(self) -> str:
-        try:
-            if self._browser: self._browser.close()
-            if self._pw:      self._pw.stop()
-        except Exception:
-            pass
+        self._exe = self._name = ""
+        if self._browser:
+            try: self._browser.close()
+            except Exception: pass
+        if self._pw:
+            try: self._pw.stop()
+            except Exception: pass
         self._browser = self._context = self._page = self._pw = None
-        return "Browser closed"
+        return "Browser session closed"
+
+    # ── CDP connect (for summarize tab only) ──────────────────────────────────
+
+    def connect_cdp(self, port: int = 9222) -> Tuple[bool, str]:
+        """Connect to already-running browser via CDP for page reading."""
+        for p in [port, 9223, 9224]:
+            try:
+                from playwright.sync_api import sync_playwright
+                pw = sync_playwright().start()
+                browser = pw.chromium.connect_over_cdp(f"http://localhost:{p}")
+                self._pw = pw; self._browser = browser
+                ctx = browser.contexts[0] if browser.contexts else browser.new_context()
+                self._context = ctx
+                pages = ctx.pages
+                self._page = pages[0] if pages else ctx.new_page()
+                return True, f"Connected on port {p}"
+            except Exception:
+                try: pw.stop()
+                except Exception: pass
+                continue
+        return False, "No browser found on debug ports 9222-9224"
 
     # ── Profile resolution ────────────────────────────────────────────────────
 
     def _resolve_profile_dir(self, browser: str, name: str) -> Optional[str]:
-        """Resolve spoken profile name to Chrome profile directory name."""
         udir = self.USER_DATA_DIRS.get(browser)
         if not udir or not udir.exists():
             return None
@@ -1010,28 +919,21 @@ class BrowserSession:
         if m:
             n = int(m.group())
             return "Default" if n == 1 else f"Profile {n - 1}"
-        # Search by profile display name in Preferences file
         try:
             import json
             for d in udir.iterdir():
-                if not d.is_dir():
-                    continue
-                if d.name == "Default" or d.name.startswith("Profile"):
+                if d.is_dir() and (d.name == "Default" or d.name.startswith("Profile")):
                     prefs = d / "Preferences"
                     if prefs.exists():
-                        try:
-                            data  = json.loads(prefs.read_text(errors="ignore"))
-                            pname = data.get("profile", {}).get("name", "").lower()
-                            if nl in pname or pname in nl:
-                                return d.name
-                        except Exception:
-                            pass
+                        pn = json.loads(prefs.read_text(errors="ignore")
+                             ).get("profile", {}).get("name", "").lower()
+                        if nl in pn or pn in nl:
+                            return d.name
         except Exception:
             pass
         return None
 
-    # Keep backward compat
-    def _find_profile(self, browser: str, name: str) -> Optional[str]:
+    def _find_profile(self, browser, name):
         return self._resolve_profile_dir(browser, name)
 
 
